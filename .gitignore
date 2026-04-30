@@ -1,0 +1,13 @@
+# Node
+node_modules/
+
+# Foundry
+foundry/lib/
+foundry/out/
+foundry/cache/
+foundry/broadcast/
+foundry/.env
+
+# OS
+.DS_Store
+Thumbs.db
