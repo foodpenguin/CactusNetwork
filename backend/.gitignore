@@ -1,0 +1,12 @@
+.env
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+data/databases/*.db
+data/databases/*.db-*
+archive/**/*.zip
+archive/**/*.db
+
+.DS_Store

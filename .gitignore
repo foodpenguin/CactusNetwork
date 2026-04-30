@@ -8,6 +8,16 @@ foundry/cache/
 foundry/broadcast/
 foundry/.env
 
+# Backend local state and secrets
+backend/.env
+backend/.venv/
+backend/.pytest_cache/
+backend/**/__pycache__/
+backend/**/*.py[cod]
+backend/data/
+backend/archive/
+backend/CactusNetwork_Project_Plan.md
+
 # OS
 .DS_Store
 Thumbs.db
