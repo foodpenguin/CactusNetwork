@@ -66,10 +66,39 @@ class KeeperHubDispatchRequest(BaseModel):
     輸入：
     - `webhook_url`：可選；不填則使用後端預設 KeeperHub URL 或 `.env`。
     - `timeout_seconds`：HTTP POST 等待秒數。
+    - `webhook_headers`：可選；KeeperHub 需要授權時可放額外 HTTP headers。
+    - `wait_for_final_result`：可選；若為 `True`，dispatch 後會等待 KeeperHub status API 回到最終結果。
+    - `poll_interval_seconds`：等待最終結果時的查詢間隔。
+    - `max_wait_seconds`：等待最終結果的最長秒數。
+    - `status_api_base`：可選 KeeperHub status API base URL。
+    - `status_headers`：可選 KeeperHub status API 額外 headers。
     """
 
     webhook_url: Optional[str] = None
     timeout_seconds: float = Field(default=60.0, gt=0)
+    webhook_headers: dict[str, str] = Field(default_factory=dict)
+    wait_for_final_result: bool = False
+    poll_interval_seconds: float = Field(default=5.0, gt=0)
+    max_wait_seconds: float = Field(default=300.0, ge=0)
+    status_api_base: Optional[str] = None
+    status_headers: dict[str, str] = Field(default_factory=dict)
+
+
+class KeeperHubRefreshRequest(BaseModel):
+    """
+    刷新 KeeperHub running executions 的內部請求。
+
+    輸入：
+    - `limit`：本次最多檢查幾筆已 dispatched 的 execution。
+    - `timeout_seconds`：每次 KeeperHub status API GET 等待秒數。
+    - `status_api_base`：可選；不填則使用 `.env` 或預設 KeeperHub status API。
+    - `status_headers`：可選；KeeperHub status API 需要授權時可放額外 HTTP headers。
+    """
+
+    limit: int = Field(default=20, ge=1)
+    timeout_seconds: float = Field(default=60.0, gt=0)
+    status_api_base: Optional[str] = None
+    status_headers: dict[str, str] = Field(default_factory=dict)
 
 
 app = FastAPI(
@@ -214,6 +243,41 @@ def dispatch_execution_to_keeperhub(
             execution_id,
             webhook_url=payload.webhook_url,
             timeout_seconds=payload.timeout_seconds,
+            webhook_headers=payload.webhook_headers,
+            wait_for_final_result=payload.wait_for_final_result,
+            poll_interval_seconds=payload.poll_interval_seconds,
+            max_wait_seconds=payload.max_wait_seconds,
+            status_api_base=payload.status_api_base,
+            status_headers=payload.status_headers,
+        )
+    )
+
+
+@app.post("/internal/executions/keeperhub/refresh", summary="刷新 KeeperHub 執行結果")
+def refresh_keeperhub_executions(
+    payload: KeeperHubRefreshRequest,
+    x_internal_token: str = Header(default=""),
+) -> dict[str, Any]:
+    """
+    檢查已送到 KeeperHub 的 running executions，拿到最終結果後自動收尾。
+
+    輸入：
+    - Header：`X-Internal-Token`。
+    - JSON body：`KeeperHubRefreshRequest`。
+
+    輸出：
+    - `waiting`：仍在 KeeperHub running / pending。
+    - `finalized`：本次已 confirmed / failed 的 execution。
+    - `skipped`：缺少 KeeperHub execution id 或重複資料。
+    - `errors`：KeeperHub status API 讀取失敗。
+    """
+    _require_internal_token(x_internal_token)
+    return _call_or_404(
+        lambda: execution_messages.refresh_keeperhub_execution_results(
+            limit=payload.limit,
+            timeout_seconds=payload.timeout_seconds,
+            status_api_base=payload.status_api_base,
+            status_headers=payload.status_headers,
         )
     )
 
