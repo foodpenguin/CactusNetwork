@@ -571,6 +571,13 @@ X-Internal-Token: <INTERNAL_API_TOKEN>
   "timeout_seconds": 60,
   "webhook_headers": {
     "Authorization": "Bearer <KeeperHub token>"
+  },
+  "wait_for_final_result": true,
+  "poll_interval_seconds": 5,
+  "max_wait_seconds": 300,
+  "status_api_base": "https://app.keeperhub.com/api/workflows/executions",
+  "status_headers": {
+    "Authorization": "Bearer <KeeperHub API token>"
   }
 }
 ```
@@ -630,11 +637,30 @@ KEEPERHUB_WEBHOOK_TOKEN=<KeeperHub token>
   "keeperhub": {
     "httpStatusCode": 202,
     "body": {
-      "accepted": true
+      "id": "keeperhub_execution_id",
+      "status": "running"
     }
   }
 }
 ```
+
+這代表 KeeperHub 已經開始處理，但還不是最終結果。後端會把本地 execution 留在：
+
+```text
+dispatched
+```
+
+直到後續拿到 KeeperHub `success / error / failed / cancelled`，才會真正結束。
+
+如果 dispatch 時傳：
+
+```json
+{
+  "wait_for_final_result": true
+}
+```
+
+後端會在這次請求內持續查 KeeperHub status API，直到拿到 success / failed 或超過 `max_wait_seconds`。
 
 如果 KeeperHub 直接回覆：
 
@@ -648,7 +674,124 @@ KEEPERHUB_WEBHOOK_TOKEN=<KeeperHub token>
 
 後端會自動把該筆 execution 當成 confirmed 處理，並更新訂單。
 
-## 10. 回報鏈上結果
+## 10. 自動刷新 KeeperHub 結果
+
+```text
+POST /internal/executions/keeperhub/refresh
+```
+
+### Header
+
+```text
+X-Internal-Token: <INTERNAL_API_TOKEN>
+```
+
+### 傳入
+
+```json
+{
+  "limit": 20,
+  "timeout_seconds": 60
+}
+```
+
+也可以指定 KeeperHub status API：
+
+```json
+{
+  "limit": 20,
+  "timeout_seconds": 60,
+  "status_api_base": "https://app.keeperhub.com/api/workflows/executions",
+  "status_headers": {
+    "Authorization": "Bearer <KeeperHub API token>"
+  }
+}
+```
+
+`.env` 可設定：
+
+```text
+KEEPERHUB_STATUS_AUTHORIZATION=Bearer <KeeperHub API token>
+```
+
+或：
+
+```text
+KEEPERHUB_STATUS_TOKEN=<KeeperHub API token>
+```
+
+也支援通用名稱：
+
+```text
+KEEPERHUB_API_AUTHORIZATION=Bearer <KeeperHub API token>
+KEEPERHUB_API_TOKEN=<KeeperHub API token>
+```
+
+### 傳出
+
+```json
+{
+  "status": "keeperhub_refresh_completed",
+  "checkedCount": 2,
+  "waiting": [
+    {
+      "executionId": "execution:1:match:1",
+      "keeperhubExecutionId": "keeperhub_execution_id",
+      "keeperhubStatus": "running"
+    }
+  ],
+  "finalized": [
+    {
+      "executionId": "execution:1:match:2",
+      "keeperhubExecutionId": "keeperhub_execution_id_2",
+      "executionStatus": "confirmed",
+      "keeperhubStatus": "success"
+    }
+  ],
+  "skipped": [],
+  "errors": []
+}
+```
+
+### 意思
+
+後端只會刷新本地狀態為：
+
+```text
+dispatched
+```
+
+的 execution。
+
+KeeperHub 回覆：
+
+```text
+running / pending
+```
+
+時，後端不會扣訂單，也不會結束 execution。
+
+KeeperHub 回覆：
+
+```text
+success / confirmed / completed
+```
+
+時，後端會將 execution 視為 confirmed，正式更新買賣單剩餘數量。
+
+KeeperHub 回覆：
+
+```text
+error / failed / cancelled
+```
+
+時，後端會將 execution 視為 failed，不更新買賣單。
+
+如果同一筆 execution 已經是 confirmed 或 failed，後端不會再處理一次，所以重複刷新不會重複扣單。
+
+注意：webhook trigger token 與 KeeperHub status API token 可能不是同一種 token。若 status API 回 401，請向 KeeperHub 取得可讀 execution status 的 API token，或改由 KeeperHub workflow 在結束時呼叫下一節的 result callback。
+
+## 11. 回報鏈上結果
 
 ```text
 POST /internal/executions/{execution_id}/result
@@ -716,6 +859,7 @@ X-Internal-Token: <INTERNAL_API_TOKEN>
 ```text
 6. GET /internal/executions/pending
 7A. POST /internal/executions/{execution_id}/keeperhub/dispatch
+8A. POST /internal/executions/keeperhub/refresh
 ```
 
 如果不用後端直接送 KeeperHub，也可以維持手動區塊鏈端流程：

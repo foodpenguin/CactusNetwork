@@ -287,11 +287,26 @@ def test_internal_api_can_dispatch_execution_to_keeperhub(monkeypatch: pytest.Mo
         params={"ready_only": True},
     ).json()[0]["executionId"]
 
-    def fake_send_execution_to_keeperhub(execution_id_arg, webhook_url, timeout_seconds, webhook_headers):
+    def fake_send_execution_to_keeperhub(
+        execution_id_arg,
+        webhook_url,
+        timeout_seconds,
+        webhook_headers,
+        wait_for_final_result,
+        poll_interval_seconds,
+        max_wait_seconds,
+        status_api_base,
+        status_headers,
+    ):
         captured["execution_id"] = execution_id_arg
         captured["webhook_url"] = webhook_url
         captured["timeout_seconds"] = timeout_seconds
         captured["webhook_headers"] = webhook_headers
+        captured["wait_for_final_result"] = wait_for_final_result
+        captured["poll_interval_seconds"] = poll_interval_seconds
+        captured["max_wait_seconds"] = max_wait_seconds
+        captured["status_api_base"] = status_api_base
+        captured["status_headers"] = status_headers
         return {
             "status": "keeperhub_dispatch_completed",
             "executionId": execution_id_arg,
@@ -308,6 +323,11 @@ def test_internal_api_can_dispatch_execution_to_keeperhub(monkeypatch: pytest.Mo
             "webhook_url": "https://example.com/webhook",
             "timeout_seconds": 9,
             "webhook_headers": {"Authorization": "Bearer test"},
+            "wait_for_final_result": True,
+            "poll_interval_seconds": 2,
+            "max_wait_seconds": 20,
+            "status_api_base": "https://example.com/executions",
+            "status_headers": {"Authorization": "Bearer status-token"},
         },
     )
 
@@ -318,6 +338,53 @@ def test_internal_api_can_dispatch_execution_to_keeperhub(monkeypatch: pytest.Mo
         "webhook_url": "https://example.com/webhook",
         "timeout_seconds": 9,
         "webhook_headers": {"Authorization": "Bearer test"},
+        "wait_for_final_result": True,
+        "poll_interval_seconds": 2,
+        "max_wait_seconds": 20,
+        "status_api_base": "https://example.com/executions",
+        "status_headers": {"Authorization": "Bearer status-token"},
     }
     assert buy_id > 0
     assert sell_id > 0
+
+
+def test_internal_api_can_refresh_keeperhub_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    """測試 internal API 可觸發 KeeperHub running execution 自動收尾。"""
+    captured: dict[str, object] = {}
+
+    def fake_refresh_keeperhub_execution_results(limit, timeout_seconds, status_api_base, status_headers):
+        captured["limit"] = limit
+        captured["timeout_seconds"] = timeout_seconds
+        captured["status_api_base"] = status_api_base
+        captured["status_headers"] = status_headers
+        return {
+            "status": "keeperhub_refresh_completed",
+            "checkedCount": 1,
+            "waiting": [],
+            "finalized": [{"executionId": "execution:1:match:1", "executionStatus": "confirmed"}],
+            "skipped": [],
+            "errors": [],
+        }
+
+    monkeypatch.setattr(execution_messages, "refresh_keeperhub_execution_results", fake_refresh_keeperhub_execution_results)
+
+    response = client.post(
+        "/internal/executions/keeperhub/refresh",
+        headers=auth_headers(),
+        json={
+            "limit": 3,
+            "timeout_seconds": 11,
+            "status_api_base": "https://example.com/executions",
+            "status_headers": {"Authorization": "Bearer status-token"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "keeperhub_refresh_completed"
+    assert response.json()["finalized"][0]["executionStatus"] == "confirmed"
+    assert captured == {
+        "limit": 3,
+        "timeout_seconds": 11,
+        "status_api_base": "https://example.com/executions",
+        "status_headers": {"Authorization": "Bearer status-token"},
+    }
