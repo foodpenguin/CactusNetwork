@@ -2,15 +2,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
+
+import httpx
 
 from scripts import orchestrator_server
 
 
 FINAL_EXECUTION_STATUSES = {"confirmed", "failed"}
 REQUIRED_INTENT_FIELDS = ("user", "tokenIn", "tokenOut", "amountIn", "minAmountOut", "deadline", "salt", "allowPartialFill")
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+ENV_FILE = PROJECT_DIR / ".env"
+KEEPERHUB_WEBHOOK_URL_ENV = "KEEPERHUB_WEBHOOK_URL"
+DEFAULT_KEEPERHUB_WEBHOOK_URL = "https://app.keeperhub.com/api/workflows/o2o3h3yf8s6ps4ogg8h81/webhook"
+DEFAULT_KEEPERHUB_TIMEOUT_SECONDS = 60.0
 
 
 def get_pending_execution_requests(limit: int = 20, ready_only: bool = False) -> list[dict[str, Any]]:
@@ -162,6 +171,66 @@ def submit_execution_result(execution_id: str, result: dict[str, Any]) -> dict[s
     }
 
 
+def send_execution_to_keeperhub(
+    execution_id: str,
+    webhook_url: str | None = None,
+    timeout_seconds: float = DEFAULT_KEEPERHUB_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """
+    將一筆 ready execution payload 送到 KeeperHub webhook，並回收 webhook 結果。
+
+    輸入：
+    - `execution_id`：要送出的 execution id。
+    - `webhook_url`：KeeperHub webhook URL；未提供時讀取 `.env` 的 `KEEPERHUB_WEBHOOK_URL`，再退回預設 URL。
+    - `timeout_seconds`：HTTP POST 等待秒數。
+
+    輸出：
+    - 回傳 KeeperHub HTTP 回覆與本地 execution 狀態。
+    - 若 KeeperHub 回覆包含 `status = confirmed` 或 `status = failed`，會自動呼叫 `submit_execution_result()`。
+
+    副作用：
+    - 成功 POST 後會先將 execution 標記為 `dispatched`。
+    - 若 KeeperHub 已回傳最終結果，會依 confirmed / failed 更新 execution 與訂單。
+    """
+    request = get_execution_request(execution_id)
+    if request["status"] != "proposed":
+        raise ValueError(f"execution_id={execution_id} 目前狀態不是 proposed")
+    if not request["readyForExecutor"]:
+        raise ValueError(f"execution_id={execution_id} 缺少必要欄位：{request['missingFields']}")
+
+    target_url = _resolve_keeperhub_webhook_url(webhook_url)
+    keeperhub_response = _post_json(target_url, request["payload"], timeout_seconds)
+    dispatch = mark_execution_dispatched(
+        execution_id,
+        {
+            "target": "keeperhub",
+            "webhookUrl": target_url,
+            "httpStatusCode": keeperhub_response["httpStatusCode"],
+            "webhookResponse": keeperhub_response["body"],
+        },
+    )
+
+    final_result = _extract_keeperhub_execution_result(keeperhub_response["body"])
+    if final_result is None:
+        return {
+            "status": "keeperhub_dispatch_completed",
+            "executionId": execution_id,
+            "executionStatus": dispatch["executionStatus"],
+            "keeperhub": keeperhub_response,
+            "dispatchResult": dispatch,
+        }
+
+    submit_result = submit_execution_result(execution_id, final_result)
+    return {
+        "status": "keeperhub_result_accepted",
+        "executionId": execution_id,
+        "executionStatus": submit_result["executionStatus"],
+        "keeperhub": keeperhub_response,
+        "dispatchResult": dispatch,
+        "submitResult": submit_result,
+    }
+
+
 def run_cli() -> None:
     """
     區塊鏈端 execution message 介面 CLI。
@@ -193,6 +262,11 @@ def run_cli() -> None:
     submit_parser.add_argument("execution_id")
     submit_parser.add_argument("--result-json", required=True)
 
+    keeperhub_parser = subparsers.add_parser("keeperhub")
+    keeperhub_parser.add_argument("execution_id")
+    keeperhub_parser.add_argument("--webhook-url")
+    keeperhub_parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_KEEPERHUB_TIMEOUT_SECONDS)
+
     args = parser.parse_args()
     if args.command == "pending":
         output = get_pending_execution_requests(limit=args.limit, ready_only=args.ready_only)
@@ -202,6 +276,12 @@ def run_cli() -> None:
         output = mark_execution_dispatched(args.execution_id, json.loads(args.metadata_json))
     elif args.command == "submit":
         output = submit_execution_result(args.execution_id, json.loads(args.result_json))
+    elif args.command == "keeperhub":
+        output = send_execution_to_keeperhub(
+            args.execution_id,
+            webhook_url=args.webhook_url,
+            timeout_seconds=args.timeout_seconds,
+        )
     else:
         raise ValueError(f"未知 command：{args.command}")
     print(json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True))
@@ -372,6 +452,98 @@ def _normalize_execution_result(result: dict[str, Any]) -> dict[str, Any]:
         "notes": result.get("notes") or "blockchain executor confirmed execution",
         "rawResult": result,
     }
+
+
+def _resolve_keeperhub_webhook_url(webhook_url: str | None = None) -> str:
+    """
+    取得 KeeperHub webhook URL。
+
+    輸入：
+    - `webhook_url`：呼叫端明確指定的 URL。
+
+    輸出：
+    - 回傳實際要 POST 的 URL。
+    """
+    _load_env()
+    resolved = webhook_url or os.getenv(KEEPERHUB_WEBHOOK_URL_ENV) or DEFAULT_KEEPERHUB_WEBHOOK_URL
+    if not resolved.startswith("https://"):
+        raise ValueError("KeeperHub webhook URL 必須是 https://")
+    return resolved
+
+
+def _post_json(url: str, payload: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
+    """
+    POST JSON 到外部 webhook。
+
+    輸入：
+    - `url`：目標 URL。
+    - `payload`：要送出的嚴格區塊鏈 payload。
+    - `timeout_seconds`：等待秒數。
+
+    輸出：
+    - 回傳 HTTP 狀態碼與解析後 body。
+    """
+    try:
+        response = httpx.post(url, json=payload, timeout=timeout_seconds)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise ValueError(f"KeeperHub webhook 發送失敗：{exc}") from exc
+
+    try:
+        body: Any = response.json()
+    except ValueError:
+        body = response.text
+    return {"httpStatusCode": response.status_code, "body": body}
+
+
+def _extract_keeperhub_execution_result(body: Any) -> dict[str, Any] | None:
+    """
+    從 KeeperHub 回覆中取出 confirmed / failed 結果。
+
+    輸入：
+    - `body`：KeeperHub webhook 回覆 body。
+
+    輸出：
+    - 若找到 `status = confirmed` 或 `status = failed`，回傳可交給 `submit_execution_result()` 的 dict。
+    - 若 KeeperHub 只回覆接收成功，回傳 `None`。
+    """
+    if not isinstance(body, dict):
+        return None
+
+    candidates = [
+        body,
+        body.get("result"),
+        body.get("data"),
+        body.get("executionResult"),
+        body.get("receipt"),
+    ]
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        status = str(candidate.get("status") or "").strip()
+        if status in ("confirmed", "failed"):
+            return candidate
+    return None
+
+
+def _load_env(path: Path = ENV_FILE) -> None:
+    """
+    讀取 `.env` 到目前 process。
+
+    輸入：
+    - `path`：`.env` 路徑。
+
+    輸出：
+    - 無。
+    """
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
 def _json_loads(raw_json: str | None) -> Any:

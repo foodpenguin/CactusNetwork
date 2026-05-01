@@ -543,7 +543,97 @@ X-Internal-Token: <INTERNAL_API_TOKEN>
 這筆已經送出，正在等鏈上結果。
 ```
 
-## 9. 回報鏈上結果
+## 9. 直接送到 KeeperHub webhook
+
+```text
+POST /internal/executions/{execution_id}/keeperhub/dispatch
+```
+
+### Header
+
+```text
+X-Internal-Token: <INTERNAL_API_TOKEN>
+```
+
+### 傳入
+
+通常不用傳內容，後端會使用預設 KeeperHub webhook：
+
+```json
+{}
+```
+
+也可以指定：
+
+```json
+{
+  "webhook_url": "https://app.keeperhub.com/api/workflows/o2o3h3yf8s6ps4ogg8h81/webhook",
+  "timeout_seconds": 60
+}
+```
+
+### 後端實際送給 KeeperHub 的內容
+
+後端只會把 execution 裡的嚴格 `payload` 送出去：
+
+```json
+{
+  "intentA": {
+    "intent": {
+      "user": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      "tokenIn": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+      "tokenOut": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+      "amountIn": "1000000000000000000",
+      "minAmountOut": "3000000000",
+      "deadline": 1735689600,
+      "salt": "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b",
+      "allowPartialFill": true
+    },
+    "signature": "0xa1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b200"
+  },
+  "actionType": 0,
+  "executeAmountIn": "500000000000000000",
+  "routeDetails": {
+    "Calldata": "0x04e45aaf...",
+    "matchedIntentB": null,
+    "treasuryAmountOut": null
+  }
+}
+```
+
+不會把 `executionId`、`status`、`readyForExecutor` 一起送給 KeeperHub。
+
+### 傳出
+
+如果 KeeperHub 只回覆已接收：
+
+```json
+{
+  "status": "keeperhub_dispatch_completed",
+  "executionId": "exec_20260501_000001",
+  "executionStatus": "dispatched",
+  "keeperhub": {
+    "httpStatusCode": 202,
+    "body": {
+      "accepted": true
+    }
+  }
+}
+```
+
+如果 KeeperHub 直接回覆：
+
+```json
+{
+  "status": "confirmed",
+  "tx_hash": "0xConfirmedTxHash",
+  "block_number": 123456
+}
+```
+
+後端會自動把該筆 execution 當成 confirmed 處理，並更新訂單。
+
+## 10. 回報鏈上結果
 
 ```text
 POST /internal/executions/{execution_id}/result
@@ -610,8 +700,14 @@ X-Internal-Token: <INTERNAL_API_TOKEN>
 
 ```text
 6. GET /internal/executions/pending
-7. POST /internal/executions/{execution_id}/dispatch
-8. POST /internal/executions/{execution_id}/result
+7A. POST /internal/executions/{execution_id}/keeperhub/dispatch
+```
+
+如果不用後端直接送 KeeperHub，也可以維持手動區塊鏈端流程：
+
+```text
+7B. POST /internal/executions/{execution_id}/dispatch
+8B. POST /internal/executions/{execution_id}/result
 ```
 
 一句話：
@@ -619,5 +715,5 @@ X-Internal-Token: <INTERNAL_API_TOKEN>
 ```text
 前端只負責建立帳號、登入、送買單、送賣單。
 後端只負責媒合並輸出嚴格區塊鏈 payload。
-區塊鏈端只負責拿 execution request、送鏈上、回報結果。
+KeeperHub 或區塊鏈端只負責拿 payload、送鏈上、回報結果。
 ```

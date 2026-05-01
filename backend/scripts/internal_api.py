@@ -3,7 +3,7 @@ from __future__ import annotations
 import hmac
 import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -57,6 +57,19 @@ class ExecutionResultRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     status: Literal["confirmed", "failed"]
+
+
+class KeeperHubDispatchRequest(BaseModel):
+    """
+    將 execution payload 送到 KeeperHub webhook 的內部請求。
+
+    輸入：
+    - `webhook_url`：可選；不填則使用後端預設 KeeperHub URL 或 `.env`。
+    - `timeout_seconds`：HTTP POST 等待秒數。
+    """
+
+    webhook_url: Optional[str] = None
+    timeout_seconds: float = Field(default=60.0, gt=0)
 
 
 app = FastAPI(
@@ -175,6 +188,34 @@ def submit_execution_result(
     """
     _require_internal_token(x_internal_token)
     return _call_or_404(lambda: execution_messages.submit_execution_result(execution_id, payload.model_dump()))
+
+
+@app.post("/internal/executions/{execution_id}/keeperhub/dispatch", summary="送出交易請求到 KeeperHub")
+def dispatch_execution_to_keeperhub(
+    execution_id: str,
+    payload: KeeperHubDispatchRequest,
+    x_internal_token: str = Header(default=""),
+) -> dict[str, Any]:
+    """
+    將嚴格區塊鏈 payload 送到 KeeperHub webhook。
+
+    輸入：
+    - Header：`X-Internal-Token`。
+    - Path：`execution_id`。
+    - JSON body：`KeeperHubDispatchRequest`。
+
+    輸出：
+    - 回傳 KeeperHub 回覆與本地 execution 狀態。
+    - 若 KeeperHub 回覆 confirmed / failed，後端會同步套用該結果。
+    """
+    _require_internal_token(x_internal_token)
+    return _call_or_404(
+        lambda: execution_messages.send_execution_to_keeperhub(
+            execution_id,
+            webhook_url=payload.webhook_url,
+            timeout_seconds=payload.timeout_seconds,
+        )
+    )
 
 
 def _require_internal_token(provided_token: str) -> None:

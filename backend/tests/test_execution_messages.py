@@ -250,3 +250,68 @@ def test_failed_execution_result_does_not_update_orders() -> None:
     assert buy_status == "pending"
     assert sell_remaining == 1
     assert sell_status == "pending"
+
+
+def test_send_execution_to_keeperhub_posts_payload_and_accepts_confirmed_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    """測試可將嚴格 payload 送到 KeeperHub，並在回覆 confirmed 時正式扣單。"""
+    payload = make_ready_blockchain_payload()
+    execution_id, buy_id, sell_id = create_proposed_execution(payload)
+    captured: dict[str, object] = {}
+
+    def fake_post_json(url: str, posted_payload: dict, timeout_seconds: float) -> dict:
+        captured["url"] = url
+        captured["payload"] = posted_payload
+        captured["timeout_seconds"] = timeout_seconds
+        return {
+            "httpStatusCode": 200,
+            "body": {
+                "status": "confirmed",
+                "tx_hash": "0xkeeper",
+                "block_number": 789,
+            },
+        }
+
+    monkeypatch.setattr(execution_messages, "_post_json", fake_post_json)
+
+    result = execution_messages.send_execution_to_keeperhub(execution_id, timeout_seconds=12)
+    buy_remaining, buy_status = fetch_order_remaining(orchestrator_server.BUY_ORDERS_DB, "buy_orders", buy_id)
+    sell_remaining, sell_status = fetch_order_remaining(orchestrator_server.SELL_ORDERS_DB, "sell_orders", sell_id)
+
+    assert captured["url"] == execution_messages.DEFAULT_KEEPERHUB_WEBHOOK_URL
+    assert captured["payload"] == payload
+    assert captured["timeout_seconds"] == 12
+    assert result["status"] == "keeperhub_result_accepted"
+    assert result["executionStatus"] == "confirmed"
+    assert result["keeperhub"]["body"]["tx_hash"] == "0xkeeper"
+    assert buy_remaining == 1
+    assert buy_status == "pending"
+    assert sell_remaining == 0
+    assert sell_status == "filled"
+
+
+def test_send_execution_to_keeperhub_keeps_dispatched_when_response_is_not_final(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """測試 KeeperHub 只回覆接收成功時，後端只標記 dispatched，不扣訂單。"""
+    execution_id, buy_id, sell_id = create_proposed_execution(make_ready_blockchain_payload())
+
+    def fake_post_json(url: str, posted_payload: dict, timeout_seconds: float) -> dict:
+        return {"httpStatusCode": 202, "body": {"accepted": True, "requestId": "keeper-1"}}
+
+    monkeypatch.setattr(execution_messages, "_post_json", fake_post_json)
+
+    result = execution_messages.send_execution_to_keeperhub(
+        execution_id,
+        webhook_url="https://example.com/webhook",
+    )
+    request = execution_messages.get_execution_request(execution_id)
+    buy_remaining, buy_status = fetch_order_remaining(orchestrator_server.BUY_ORDERS_DB, "buy_orders", buy_id)
+    sell_remaining, sell_status = fetch_order_remaining(orchestrator_server.SELL_ORDERS_DB, "sell_orders", sell_id)
+
+    assert result["status"] == "keeperhub_dispatch_completed"
+    assert result["executionStatus"] == "dispatched"
+    assert request["status"] == "dispatched"
+    assert buy_remaining == 2
+    assert buy_status == "pending"
+    assert sell_remaining == 1
+    assert sell_status == "pending"

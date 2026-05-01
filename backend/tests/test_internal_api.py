@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from scripts import api_server
 from scripts import blockchain_sync
+from scripts import execution_messages
 from scripts import internal_api
 from scripts import matching_service
 from scripts import orchestrator_server
@@ -267,3 +268,50 @@ def test_internal_api_failed_result_does_not_update_orders() -> None:
     assert response.json()["executionStatus"] == "failed"
     assert buy == (1, "pending")
     assert sell == (1, "pending")
+
+
+def test_internal_api_can_dispatch_execution_to_keeperhub(monkeypatch: pytest.MonkeyPatch) -> None:
+    """測試 internal API 可把 execution payload 轉送到 KeeperHub webhook。"""
+    buy_id = insert_buy_order()
+    sell_id = insert_sell_order()
+    captured: dict[str, object] = {}
+
+    client.post(
+        "/internal/matching/run",
+        headers=auth_headers(),
+        json={"agent": "main-brain", "candidate_limit": 5, "drain_until_empty": False},
+    )
+    execution_id = client.get(
+        "/internal/executions/pending",
+        headers=auth_headers(),
+        params={"ready_only": True},
+    ).json()[0]["executionId"]
+
+    def fake_send_execution_to_keeperhub(execution_id_arg, webhook_url, timeout_seconds):
+        captured["execution_id"] = execution_id_arg
+        captured["webhook_url"] = webhook_url
+        captured["timeout_seconds"] = timeout_seconds
+        return {
+            "status": "keeperhub_dispatch_completed",
+            "executionId": execution_id_arg,
+            "executionStatus": "dispatched",
+            "keeperhub": {"httpStatusCode": 202, "body": {"accepted": True}},
+        }
+
+    monkeypatch.setattr(execution_messages, "send_execution_to_keeperhub", fake_send_execution_to_keeperhub)
+
+    response = client.post(
+        f"/internal/executions/{execution_id}/keeperhub/dispatch",
+        headers=auth_headers(),
+        json={"webhook_url": "https://example.com/webhook", "timeout_seconds": 9},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["executionStatus"] == "dispatched"
+    assert captured == {
+        "execution_id": execution_id,
+        "webhook_url": "https://example.com/webhook",
+        "timeout_seconds": 9,
+    }
+    assert buy_id > 0
+    assert sell_id > 0
