@@ -568,8 +568,23 @@ X-Internal-Token: <INTERNAL_API_TOKEN>
 ```json
 {
   "webhook_url": "https://app.keeperhub.com/api/workflows/o2o3h3yf8s6ps4ogg8h81/webhook",
-  "timeout_seconds": 60
+  "timeout_seconds": 60,
+  "webhook_headers": {
+    "Authorization": "Bearer <KeeperHub token>"
+  }
 }
+```
+
+如果 KeeperHub webhook 需要授權，也可以在 `.env` 放：
+
+```text
+KEEPERHUB_WEBHOOK_AUTHORIZATION=Bearer <KeeperHub token>
+```
+
+或：
+
+```text
+KEEPERHUB_WEBHOOK_TOKEN=<KeeperHub token>
 ```
 
 ### 後端實際送給 KeeperHub 的內容

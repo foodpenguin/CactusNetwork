@@ -174,6 +174,8 @@ def fetch_order_remaining(db_path: Path, table_name: str, order_id: int) -> tupl
 def test_get_pending_execution_requests_returns_formatted_payload() -> None:
     """測試區塊鏈端可取得待處理嚴格 payload。"""
     payload = make_ready_blockchain_payload()
+    expected_payload = make_ready_blockchain_payload()
+    expected_payload["routeDetails"]["matchedIntentB"]["executeAmountInB"] = "1450"
     execution_id, _, _ = create_proposed_execution(payload)
 
     requests = execution_messages.get_pending_execution_requests(ready_only=True)
@@ -182,11 +184,11 @@ def test_get_pending_execution_requests_returns_formatted_payload() -> None:
     assert len(requests) == 1
     assert requests[0]["executionId"] == execution_id
     assert requests[0]["readyForExecutor"] is True
-    assert requests[0]["payload"] == payload
+    assert requests[0]["payload"] == expected_payload
     assert set(requests[0]["payload"]) == {"intentA", "actionType", "executeAmountIn", "routeDetails"}
     assert set(requests[0]["payload"]["routeDetails"]) == {"Calldata", "matchedIntentB", "treasuryAmountOut"}
     assert request["executionId"] == execution_id
-    assert request["payload"] == payload
+    assert request["payload"] == expected_payload
 
 
 def test_action_type_zero_requires_calldata_to_be_ready() -> None:
@@ -255,13 +257,16 @@ def test_failed_execution_result_does_not_update_orders() -> None:
 def test_send_execution_to_keeperhub_posts_payload_and_accepts_confirmed_result(monkeypatch: pytest.MonkeyPatch) -> None:
     """測試可將嚴格 payload 送到 KeeperHub，並在回覆 confirmed 時正式扣單。"""
     payload = make_ready_blockchain_payload()
+    expected_payload = make_ready_blockchain_payload()
+    expected_payload["routeDetails"]["matchedIntentB"]["executeAmountInB"] = "1450"
     execution_id, buy_id, sell_id = create_proposed_execution(payload)
     captured: dict[str, object] = {}
 
-    def fake_post_json(url: str, posted_payload: dict, timeout_seconds: float) -> dict:
+    def fake_post_json(url: str, posted_payload: dict, timeout_seconds: float, extra_headers: dict) -> dict:
         captured["url"] = url
         captured["payload"] = posted_payload
         captured["timeout_seconds"] = timeout_seconds
+        captured["extra_headers"] = extra_headers
         return {
             "httpStatusCode": 200,
             "body": {
@@ -278,8 +283,9 @@ def test_send_execution_to_keeperhub_posts_payload_and_accepts_confirmed_result(
     sell_remaining, sell_status = fetch_order_remaining(orchestrator_server.SELL_ORDERS_DB, "sell_orders", sell_id)
 
     assert captured["url"] == execution_messages.DEFAULT_KEEPERHUB_WEBHOOK_URL
-    assert captured["payload"] == payload
+    assert captured["payload"] == expected_payload
     assert captured["timeout_seconds"] == 12
+    assert captured["extra_headers"] == {}
     assert result["status"] == "keeperhub_result_accepted"
     assert result["executionStatus"] == "confirmed"
     assert result["keeperhub"]["body"]["tx_hash"] == "0xkeeper"
@@ -295,7 +301,7 @@ def test_send_execution_to_keeperhub_keeps_dispatched_when_response_is_not_final
     """測試 KeeperHub 只回覆接收成功時，後端只標記 dispatched，不扣訂單。"""
     execution_id, buy_id, sell_id = create_proposed_execution(make_ready_blockchain_payload())
 
-    def fake_post_json(url: str, posted_payload: dict, timeout_seconds: float) -> dict:
+    def fake_post_json(url: str, posted_payload: dict, timeout_seconds: float, extra_headers: dict) -> dict:
         return {"httpStatusCode": 202, "body": {"accepted": True, "requestId": "keeper-1"}}
 
     monkeypatch.setattr(execution_messages, "_post_json", fake_post_json)

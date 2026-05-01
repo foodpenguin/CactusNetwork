@@ -66,10 +66,12 @@ class KeeperHubDispatchRequest(BaseModel):
     輸入：
     - `webhook_url`：可選；不填則使用後端預設 KeeperHub URL 或 `.env`。
     - `timeout_seconds`：HTTP POST 等待秒數。
+    - `webhook_headers`：可選；KeeperHub 需要授權時可放額外 HTTP headers。
     """
 
     webhook_url: Optional[str] = None
     timeout_seconds: float = Field(default=60.0, gt=0)
+    webhook_headers: dict[str, str] = Field(default_factory=dict)
 
 
 app = FastAPI(
@@ -214,6 +216,7 @@ def dispatch_execution_to_keeperhub(
             execution_id,
             webhook_url=payload.webhook_url,
             timeout_seconds=payload.timeout_seconds,
+            webhook_headers=payload.webhook_headers,
         )
     )
 

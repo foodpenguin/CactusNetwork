@@ -167,12 +167,15 @@ def build_grok_decision_prompt(task: dict[str, Any], external_context: Optional[
 決策原則：
 1. 優先檢查內部 OTC：candidateBuyOrders 是否可以和 sellOrder 撮合。
 2. 若內部 OTC 可行，輸出 proposed_execution。
-3. 若內部 OTC 不足且 externalContext 是 null，輸出 request_external_contract_data。
-4. 若 externalContext 已提供且候選資料內有 reads.Calldata，輸出 actionType=0 的 proposed_execution。
-5. 若 externalContext 已提供，但你仍不能安全產生成交 payload，輸出 rejected。
-6. 不要回傳 matched。成交必須等 executor / keeper 回覆 confirmed 後才由中控記錄。
-7. 不要假造錢包地址、intent、signature、鏈上資料。不知道就留 null。
-8. 回覆只能是單一 JSON object，不要 Markdown，不要解釋文字。
+3. 內部 OTC 可行時，請用多筆 candidateBuyOrders 拆單，直到達到 sellOrder.remainingAmount、候選買單不足、或 sellOrder.maxSplits 上限。
+4. 每筆 match 的 filledAmount 不得超過該買單 remainingAmount，也不得讓 matches 總量超過 sellOrder.remainingAmount。
+5. 若內部 OTC 只能部分成交，仍可輸出 proposed_execution；剩餘量會等 executor confirmed 後回到隊列。
+6. 若內部 OTC 完全沒有可用候選且 externalContext 是 null，輸出 request_external_contract_data。
+7. 若 externalContext 已提供且候選資料內有 reads.Calldata，輸出 actionType=0 的 proposed_execution。
+8. 若 externalContext 已提供，但你仍不能安全產生成交 payload，輸出 rejected。
+9. 不要回傳 matched。成交必須等 executor / keeper 回覆 confirmed 後才由中控記錄。
+10. 不要假造錢包地址、intent、signature、鏈上資料。不知道就留 null；後端會用 DB 訂單資料補齊 intent/signature。
+11. 回覆只能是單一 JSON object，不要 Markdown，不要解釋文字。
 
 允許的 decisionStatus：
 - proposed_execution
@@ -345,7 +348,10 @@ def validate_grok_decision(decision: dict[str, Any], task: dict[str, Any]) -> di
 
     if status == "proposed_execution":
         if not isinstance(normalized.get("executionPayload"), dict):
-            raise ValueError("proposed_execution 必須包含 executionPayload")
+            if isinstance(normalized.get("matches"), list) and normalized["matches"]:
+                normalized["executionPayload"] = {}
+            else:
+                raise ValueError("proposed_execution 必須包含 executionPayload 或非空 matches")
         if _is_external_dex_payload(normalized["executionPayload"]):
             normalized.setdefault("matches", [])
         elif not isinstance(normalized.get("matches"), list) or not normalized["matches"]:

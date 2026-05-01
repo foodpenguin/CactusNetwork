@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from pathlib import Path
 from typing import Any
 
@@ -503,18 +504,46 @@ def record_execution_proposal(decision: dict[str, Any]) -> dict[str, Any]:
     _ensure_databases()
     sell_order_id = int(decision["sellOrderId"])
     if _is_external_dex_execution_decision(decision):
-        _validate_external_dex_execution(decision)
+        normalized_decision = _normalize_external_execution_decision(decision)
+        _validate_external_dex_execution(normalized_decision)
+        return _insert_execution_proposal(normalized_decision)
     else:
         _validate_execution_matches(decision)
+        normalized_decisions = _normalize_internal_execution_decisions(decision)
+        inserted = [_insert_execution_proposal(item) for item in normalized_decisions]
+        if len(inserted) == 1:
+            return inserted[0]
+        return {
+            "status": "execution_proposed",
+            "decisionStatus": "proposed_execution",
+            "executionStatus": "proposed",
+            "sellOrderId": sell_order_id,
+            "executionIds": [item["executionId"] for item in inserted],
+            "executions": inserted,
+            "matches": decision.get("matches", []),
+            "executionPayloads": [item["executionPayload"] for item in inserted],
+        }
+
+
+def _insert_execution_proposal(decision: dict[str, Any]) -> dict[str, Any]:
+    """
+    寫入單筆已正規化的 execution proposal。
+
+    輸入：
+    - `decision`：已含單一鏈上 payload 的 proposed_execution 決策。
+
+    輸出：
+    - 回傳單筆 execution 摘要。
+
+    副作用：
+    - 寫入 `executions.db`，狀態為 `proposed`。
+    """
+    sell_order_id = int(decision["sellOrderId"])
 
     created_at = _now().isoformat()
     task_id = decision.get("taskId")
     execution_id = str(decision.get("executionId") or f"execution:{sell_order_id}:{created_at}")
-    execution_payload = decision.get("executionPayload") or {
-        "type": "local_order_match",
-        "sellOrderId": sell_order_id,
-        "matches": decision.get("matches", []),
-    }
+    execution_payload = decision["executionPayload"]
 
     with sqlite3.connect(EXECUTIONS_DB) as conn:
         conn.execute(
@@ -1121,6 +1150,241 @@ def _load_order_or_raise(db_path: Path, table_name: str, order_id: int) -> sqlit
     return row
 
 
+def _normalize_internal_execution_decisions(decision: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    將內部 OTC proposed_execution 正規化成一或多筆鏈上 execution。
+
+    輸入：
+    - `decision`：Grok / agent 回傳的 proposed_execution，可能含多筆 `matches`。
+
+    輸出：
+    - 回傳正規化後的 decision list。
+    - 每筆 decision 只包含一個 match，並且 `executionPayload` 會補齊賣方與買方的 intent/signature。
+
+    設計原因：
+    - 目前鏈上嚴格格式的 `routeDetails.matchedIntentB` 只能表達一個對手方 intent。
+    - 若 agent 回傳多筆 matches，後端必須拆成多筆 execution，避免單一 payload 表達多筆成交造成資料不一致。
+    """
+    sell_order_id = int(decision["sellOrderId"])
+    sell_order = _load_order_or_raise(SELL_ORDERS_DB, "sell_orders", sell_order_id)
+    matches = decision.get("matches") or []
+    normalized: list[dict[str, Any]] = []
+    base_execution_id = decision.get("executionId")
+
+    for index, match in enumerate(matches, start=1):
+        buy_order_id = int(match["buyOrderId"])
+        buy_order = _load_order_or_raise(BUY_ORDERS_DB, "buy_orders", buy_order_id)
+        single_decision = dict(decision)
+        single_decision["matches"] = [dict(match)]
+        if base_execution_id or len(matches) > 1:
+            single_decision["executionId"] = f"{base_execution_id or f'execution:{sell_order_id}'}:match:{index}"
+        single_decision["executionPayload"] = _build_internal_execution_payload_from_rows(
+            sell_order=sell_order,
+            buy_order=buy_order,
+            match=match,
+            raw_payload=decision.get("executionPayload") if isinstance(decision.get("executionPayload"), dict) else None,
+        )
+        normalized.append(single_decision)
+
+    return normalized
+
+
+def _normalize_external_execution_decision(decision: dict[str, Any]) -> dict[str, Any]:
+    """
+    補齊外部 DEX proposed_execution 的賣方 intent/signature。
+
+    輸入：
+    - `decision`：actionType=0 的 proposed_execution。
+
+    輸出：
+    - 回傳已補齊 `intentA` 與 `executeAmountIn` 的 decision。
+    """
+    sell_order = _load_order_or_raise(SELL_ORDERS_DB, "sell_orders", int(decision["sellOrderId"]))
+    normalized = dict(decision)
+    payload = dict(normalized.get("executionPayload") or {})
+    route_details = dict(payload.get("routeDetails") or {})
+    payload["actionType"] = 0
+    payload["intentA"] = _merge_intent_holder(
+        primary=_build_intent_holder_from_order_row(sell_order),
+        fallback=payload.get("intentA") if isinstance(payload.get("intentA"), dict) else {},
+    )
+    payload["executeAmountIn"] = str(
+        payload.get("executeAmountIn")
+        or _scaled_order_amount(
+            intent_amount=payload["intentA"]["intent"].get("amountIn") if payload["intentA"]["intent"] else None,
+            order_amount=sell_order["amount"],
+            filled_amount=sell_order["remaining_amount"],
+            fallback_amount=sell_order["remaining_amount"],
+        )
+    )
+    route_details.setdefault("matchedIntentB", None)
+    route_details.setdefault("treasuryAmountOut", None)
+    payload["routeDetails"] = route_details
+    normalized["executionPayload"] = payload
+    return normalized
+
+
+def _build_internal_execution_payload_from_rows(
+    *,
+    sell_order: sqlite3.Row,
+    buy_order: sqlite3.Row,
+    match: dict[str, Any],
+    raw_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    依 DB 訂單資料建立 actionType=1 的嚴格鏈上 payload。
+
+    輸入：
+    - `sell_order`：賣單 row，需含 `intent_json` 與 `signature`。
+    - `buy_order`：買單 row，需含 `intent_json` 與 `signature`。
+    - `match`：單筆 match，含成交量與價格。
+    - `raw_payload`：agent 原始 payload；DB 缺欄位時作為退路。
+
+    輸出：
+    - 回傳完全遵照 execution payload 格式的 dict。
+    """
+    filled_amount = match["filledAmount"]
+    unit_price = match["unitPriceUsdc"]
+    raw_payload = raw_payload or {}
+    raw_route_details = raw_payload.get("routeDetails") if isinstance(raw_payload.get("routeDetails"), dict) else {}
+    raw_matched_intent_b = (
+        raw_route_details.get("matchedIntentB")
+        if isinstance(raw_route_details.get("matchedIntentB"), dict)
+        else {}
+    )
+    intent_a = _merge_intent_holder(
+        primary=_build_intent_holder_from_order_row(sell_order),
+        fallback=raw_payload.get("intentA") if isinstance(raw_payload.get("intentA"), dict) else {},
+    )
+    intent_b = _merge_intent_holder(
+        primary=_build_intent_holder_from_order_row(buy_order),
+        fallback=raw_matched_intent_b,
+    )
+    execute_amount_in = _scaled_order_amount(
+        intent_amount=intent_a["intent"].get("amountIn") if intent_a["intent"] else None,
+        order_amount=sell_order["amount"],
+        filled_amount=filled_amount,
+        fallback_amount=filled_amount,
+    )
+    execute_amount_in_b = _scaled_order_amount(
+        intent_amount=intent_b["intent"].get("amountIn") if intent_b["intent"] else None,
+        order_amount=buy_order["amount"],
+        filled_amount=filled_amount,
+        fallback_amount=Decimal(str(filled_amount)) * Decimal(str(unit_price)),
+    )
+    return {
+        "intentA": intent_a,
+        "actionType": 1,
+        "executeAmountIn": execute_amount_in,
+        "routeDetails": {
+            "Calldata": _calldata_from_order_rows(sell_order, buy_order) or raw_route_details.get("Calldata"),
+            "matchedIntentB": {
+                "intent": intent_b["intent"],
+                "signature": intent_b["signature"],
+                "executeAmountInB": execute_amount_in_b,
+            },
+            "treasuryAmountOut": None,
+        },
+    }
+
+
+def _build_intent_holder_from_order_row(row: sqlite3.Row) -> dict[str, Any]:
+    """
+    從訂單 row 取出前端錢包簽名資料。
+
+    輸入：
+    - `row`：買單或賣單 row。
+
+    輸出：
+    - 回傳 `{intent, signature}`；缺資料時保留 `None`，讓 ready 檢查阻擋送鏈。
+    """
+    return {
+        "intent": _parse_json_or_none(row["intent_json"]),
+        "signature": row["signature"],
+    }
+
+
+def _merge_intent_holder(primary: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    """
+    合併 intent/signature 來源。
+
+    輸入：
+    - `primary`：DB 訂單資料，優先使用。
+    - `fallback`：agent 原始 payload，DB 缺欄位時才使用。
+
+    輸出：
+    - 回傳補齊後的 `{intent, signature}`。
+    """
+    return {
+        "intent": primary.get("intent") or fallback.get("intent"),
+        "signature": primary.get("signature") or fallback.get("signature"),
+    }
+
+
+def _calldata_from_order_rows(*orders: sqlite3.Row) -> str | None:
+    """
+    從 DB 訂單 row 的 intent_json 中取出可選 Calldata。
+
+    輸入：
+    - `orders`：一或多筆買賣單 row。
+
+    輸出：
+    - 找到 `Calldata` 或 `calldata` 時回傳該字串；否則回傳 `None`。
+    """
+    for order in orders:
+        intent = _parse_json_or_none(order["intent_json"])
+        if isinstance(intent, dict):
+            calldata = intent.get("Calldata") or intent.get("calldata")
+            if isinstance(calldata, str) and calldata:
+                return calldata
+    return None
+
+
+def _scaled_order_amount(
+    *,
+    intent_amount: Any,
+    order_amount: Any,
+    filled_amount: Any,
+    fallback_amount: Any,
+) -> str:
+    """
+    將本地成交數量換算成 intent 的鏈上數量單位。
+
+    輸入：
+    - `intent_amount`：完整訂單 intent 的 `amountIn`。
+    - `order_amount`：本地訂單完整數量。
+    - `filled_amount`：本次成交的本地數量。
+    - `fallback_amount`：缺少 intent 時使用的退路數量。
+
+    輸出：
+    - 回傳字串，供 execution payload 使用。
+    """
+    try:
+        if intent_amount not in (None, "") and Decimal(str(order_amount)) > 0:
+            scaled = Decimal(str(intent_amount)) * Decimal(str(filled_amount)) / Decimal(str(order_amount))
+            return _decimal_to_payload_string(scaled, integer_like=str(intent_amount).isdigit())
+    except (InvalidOperation, ValueError, ZeroDivisionError):
+        pass
+    return _decimal_to_payload_string(Decimal(str(fallback_amount)), integer_like=False)
+
+
+def _decimal_to_payload_string(value: Decimal, integer_like: bool) -> str:
+    """
+    將 Decimal 轉成 payload 使用的字串。
+
+    輸入：
+    - `value`：要輸出的數值。
+    - `integer_like`：是否應保守輸出整數鏈上單位。
+
+    輸出：
+    - 回傳不含科學記號的字串。
+    """
+    if integer_like:
+        return str(int(value.to_integral_value(rounding=ROUND_FLOOR)))
+    normalized = value.normalize()
+    return format(normalized, "f")
+
+
 def _validate_execution_matches(decision: dict[str, Any]) -> None:
     """
     驗證成交提案內容是否符合目前本地訂單約束。
@@ -1179,11 +1443,11 @@ def _is_external_dex_execution_decision(decision: dict[str, Any]) -> bool:
     - `decision`：主腦回傳或 executions.db 裡的 proposal dict。
 
     輸出：
-    - `executionPayload.actionType == 0` 且 `routeDetails.Calldata` 存在時回傳 `True`。
+    - `executionPayload.actionType == 0` 時回傳 `True`。
+    - `Calldata` 是否存在交給 execution ready 檢查處理。
     """
     payload = decision.get("executionPayload") if isinstance(decision.get("executionPayload"), dict) else {}
-    route_details = payload.get("routeDetails") if isinstance(payload.get("routeDetails"), dict) else {}
-    return payload.get("actionType") == 0 and bool(route_details.get("Calldata"))
+    return payload.get("actionType") == 0
 
 
 def _validate_external_dex_execution(decision: dict[str, Any]) -> None:
@@ -1197,7 +1461,8 @@ def _validate_external_dex_execution(decision: dict[str, Any]) -> None:
     - 無回傳值。
 
     錯誤：
-    - 賣單不存在、賣單非 pending、payload 缺 `executeAmountIn` 或 `Calldata` 時拋出 `ValueError`。
+    - 賣單不存在、賣單非 pending 或 actionType 不是 0 時拋出 `ValueError`。
+    - `Calldata` 可暫缺，由 execution ready 檢查阻擋送出。
     """
     sell_order_id = int(decision["sellOrderId"])
     sell_order = _load_order_or_raise(SELL_ORDERS_DB, "sell_orders", sell_order_id)
@@ -1206,13 +1471,8 @@ def _validate_external_dex_execution(decision: dict[str, Any]) -> None:
 
     payload = decision.get("executionPayload") or {}
     route_details = payload.get("routeDetails") or {}
-    calldata = route_details.get("Calldata")
     if payload.get("actionType") != 0:
         raise ValueError("外部 DEX 成交提案 actionType 必須是 0")
-    if payload.get("executeAmountIn") in (None, ""):
-        raise ValueError("外部 DEX 成交提案缺 executeAmountIn")
-    if not isinstance(calldata, str) or not calldata.startswith("0x"):
-        raise ValueError("外部 DEX 成交提案缺 routeDetails.Calldata")
 
 
 def _apply_matched_decision(decision: dict[str, Any]) -> dict[str, Any]:

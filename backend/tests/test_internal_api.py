@@ -287,10 +287,11 @@ def test_internal_api_can_dispatch_execution_to_keeperhub(monkeypatch: pytest.Mo
         params={"ready_only": True},
     ).json()[0]["executionId"]
 
-    def fake_send_execution_to_keeperhub(execution_id_arg, webhook_url, timeout_seconds):
+    def fake_send_execution_to_keeperhub(execution_id_arg, webhook_url, timeout_seconds, webhook_headers):
         captured["execution_id"] = execution_id_arg
         captured["webhook_url"] = webhook_url
         captured["timeout_seconds"] = timeout_seconds
+        captured["webhook_headers"] = webhook_headers
         return {
             "status": "keeperhub_dispatch_completed",
             "executionId": execution_id_arg,
@@ -303,7 +304,11 @@ def test_internal_api_can_dispatch_execution_to_keeperhub(monkeypatch: pytest.Mo
     response = client.post(
         f"/internal/executions/{execution_id}/keeperhub/dispatch",
         headers=auth_headers(),
-        json={"webhook_url": "https://example.com/webhook", "timeout_seconds": 9},
+        json={
+            "webhook_url": "https://example.com/webhook",
+            "timeout_seconds": 9,
+            "webhook_headers": {"Authorization": "Bearer test"},
+        },
     )
 
     assert response.status_code == 200
@@ -312,6 +317,7 @@ def test_internal_api_can_dispatch_execution_to_keeperhub(monkeypatch: pytest.Mo
         "execution_id": execution_id,
         "webhook_url": "https://example.com/webhook",
         "timeout_seconds": 9,
+        "webhook_headers": {"Authorization": "Bearer test"},
     }
     assert buy_id > 0
     assert sell_id > 0

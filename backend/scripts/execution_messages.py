@@ -175,6 +175,7 @@ def send_execution_to_keeperhub(
     execution_id: str,
     webhook_url: str | None = None,
     timeout_seconds: float = DEFAULT_KEEPERHUB_TIMEOUT_SECONDS,
+    webhook_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     將一筆 ready execution payload 送到 KeeperHub webhook，並回收 webhook 結果。
@@ -183,6 +184,7 @@ def send_execution_to_keeperhub(
     - `execution_id`：要送出的 execution id。
     - `webhook_url`：KeeperHub webhook URL；未提供時讀取 `.env` 的 `KEEPERHUB_WEBHOOK_URL`，再退回預設 URL。
     - `timeout_seconds`：HTTP POST 等待秒數。
+    - `webhook_headers`：額外 HTTP headers；用於 KeeperHub 需要授權時。
 
     輸出：
     - 回傳 KeeperHub HTTP 回覆與本地 execution 狀態。
@@ -199,7 +201,7 @@ def send_execution_to_keeperhub(
         raise ValueError(f"execution_id={execution_id} 缺少必要欄位：{request['missingFields']}")
 
     target_url = _resolve_keeperhub_webhook_url(webhook_url)
-    keeperhub_response = _post_json(target_url, request["payload"], timeout_seconds)
+    keeperhub_response = _post_json(target_url, request["payload"], timeout_seconds, webhook_headers or {})
     dispatch = mark_execution_dispatched(
         execution_id,
         {
@@ -471,7 +473,12 @@ def _resolve_keeperhub_webhook_url(webhook_url: str | None = None) -> str:
     return resolved
 
 
-def _post_json(url: str, payload: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
+def _post_json(
+    url: str,
+    payload: dict[str, Any],
+    timeout_seconds: float,
+    extra_headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """
     POST JSON 到外部 webhook。
 
@@ -479,12 +486,14 @@ def _post_json(url: str, payload: dict[str, Any], timeout_seconds: float) -> dic
     - `url`：目標 URL。
     - `payload`：要送出的嚴格區塊鏈 payload。
     - `timeout_seconds`：等待秒數。
+    - `extra_headers`：呼叫端額外提供的 HTTP headers。
 
     輸出：
     - 回傳 HTTP 狀態碼與解析後 body。
     """
+    headers = _keeperhub_headers(extra_headers or {})
     try:
-        response = httpx.post(url, json=payload, timeout=timeout_seconds)
+        response = httpx.post(url, json=payload, headers=headers, timeout=timeout_seconds)
         response.raise_for_status()
     except httpx.HTTPError as exc:
         raise ValueError(f"KeeperHub webhook 發送失敗：{exc}") from exc
@@ -494,6 +503,32 @@ def _post_json(url: str, payload: dict[str, Any], timeout_seconds: float) -> dic
     except ValueError:
         body = response.text
     return {"httpStatusCode": response.status_code, "body": body}
+
+
+def _keeperhub_headers(extra_headers: dict[str, str]) -> dict[str, str]:
+    """
+    建立 KeeperHub webhook HTTP headers。
+
+    輸入：
+    - `extra_headers`：內部 API 或 CLI 呼叫端提供的額外 headers。
+
+    輸出：
+    - 回傳實際送出的 headers。
+
+    支援 `.env`：
+    - `KEEPERHUB_WEBHOOK_AUTHORIZATION`：完整 Authorization header 值。
+    - `KEEPERHUB_WEBHOOK_TOKEN`：Bearer token，會自動組成 `Authorization: Bearer ...`。
+    """
+    _load_env()
+    headers = dict(extra_headers)
+    if "Authorization" not in headers:
+        authorization = os.getenv("KEEPERHUB_WEBHOOK_AUTHORIZATION")
+        token = os.getenv("KEEPERHUB_WEBHOOK_TOKEN")
+        if authorization:
+            headers["Authorization"] = authorization
+        elif token:
+            headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 def _extract_keeperhub_execution_result(body: Any) -> dict[str, Any] | None:

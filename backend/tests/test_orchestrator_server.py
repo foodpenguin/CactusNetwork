@@ -1,4 +1,5 @@
 import sqlite3
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -53,6 +54,8 @@ def insert_buy_order(
     status: str = "pending",
     attempts: int = 0,
     created_at: Optional[str] = None,
+    intent_json: Optional[dict] = None,
+    signature: Optional[str] = None,
 ) -> int:
     """直接插入買單測試資料，回傳 buy_order id。"""
     created_at = created_at or iso_now()
@@ -71,9 +74,11 @@ def insert_buy_order(
                 status,
                 attempts,
                 created_at,
-                updated_at
+                updated_at,
+                intent_json,
+                signature
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 account_name,
@@ -88,6 +93,8 @@ def insert_buy_order(
                 attempts,
                 created_at,
                 created_at,
+                json.dumps(intent_json, ensure_ascii=False, sort_keys=True) if intent_json is not None else None,
+                signature,
             ),
         )
         conn.commit()
@@ -105,6 +112,8 @@ def insert_sell_order(
     attempts: int = 0,
     created_at: Optional[str] = None,
     queue_at: Optional[str] = None,
+    intent_json: Optional[dict] = None,
+    signature: Optional[str] = None,
 ) -> int:
     """直接插入賣單測試資料，回傳 sell_order id。"""
     created_at = created_at or iso_now()
@@ -125,9 +134,11 @@ def insert_sell_order(
                 attempts,
                 created_at,
                 updated_at,
-                queue_at
+                queue_at,
+                intent_json,
+                signature
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 account_name,
@@ -143,6 +154,8 @@ def insert_sell_order(
                 created_at,
                 created_at,
                 queue_at,
+                json.dumps(intent_json, ensure_ascii=False, sort_keys=True) if intent_json is not None else None,
+                signature,
             ),
         )
         conn.commit()
@@ -165,6 +178,20 @@ def fetch_decision(task_id: str) -> sqlite3.Row:
         "SELECT * FROM decisions WHERE task_id = ?",
         (task_id,),
     )
+
+
+def make_intent(user: str, amount_in: str, min_amount_out: str, salt: str) -> dict:
+    """建立測試用 intent JSON。"""
+    return {
+        "user": user,
+        "tokenIn": "0xTokenIn",
+        "tokenOut": "0xTokenOut",
+        "amountIn": amount_in,
+        "minAmountOut": min_amount_out,
+        "deadline": 1999999999,
+        "salt": "0x" + salt * 32,
+        "allowPartialFill": True,
+    }
 
 
 def test_status_reports_sell_queues_and_buy_pending() -> None:
@@ -337,6 +364,112 @@ def test_proposed_execution_records_execution_without_changing_orders() -> None:
         ).fetchone()
     assert execution is not None
     assert execution[1] == "proposed"
+
+
+def test_proposed_execution_fills_payload_from_order_intents() -> None:
+    """測試 Grok 只給 match 時，後端會從 DB 補齊鏈上 intent/signature。"""
+    buy_id = insert_buy_order(
+        account_name="buyer_a",
+        amount=1.2,
+        max_price=3100,
+        intent_json=make_intent("0xBuyer", "3720000000", "1200000000000000000", "11"),
+        signature="0xbuy_signature",
+    )
+    sell_id = insert_sell_order(
+        account_name="seller_a",
+        amount=2.6,
+        min_price=3000,
+        intent_json=make_intent("0xSeller", "2600000000000000000", "7800000000", "22"),
+        signature="0xsell_signature",
+    )
+
+    result = orchestrator_server.apply_agent_decision(
+        {
+            "decisionStatus": "proposed_execution",
+            "sellOrderId": sell_id,
+            "matches": [
+                {
+                    "buyOrderId": buy_id,
+                    "filledAmount": 1.2,
+                    "unitPriceUsdc": 3050,
+                }
+            ],
+        }
+    )
+
+    payload = result["executionPayload"]
+
+    assert result["executionStatus"] == "proposed"
+    assert payload["intentA"]["intent"]["user"] == "0xSeller"
+    assert payload["intentA"]["signature"] == "0xsell_signature"
+    assert payload["executeAmountIn"] == "1200000000000000000"
+    assert payload["routeDetails"]["matchedIntentB"]["intent"]["user"] == "0xBuyer"
+    assert payload["routeDetails"]["matchedIntentB"]["signature"] == "0xbuy_signature"
+    assert payload["routeDetails"]["matchedIntentB"]["executeAmountInB"] == "3720000000"
+
+
+def test_multi_match_proposed_execution_is_split_into_multiple_executions() -> None:
+    """測試多筆 matches 會拆成多筆 execution，符合單一 matchedIntentB 的鏈上格式。"""
+    buy_a = insert_buy_order(
+        account_name="buyer_a",
+        amount=1,
+        max_price=3100,
+        intent_json=make_intent("0xBuyerA", "3100000000", "1000000000000000000", "33"),
+        signature="0xbuy_a_signature",
+    )
+    buy_b = insert_buy_order(
+        account_name="buyer_b",
+        amount=1.5,
+        max_price=3080,
+        intent_json=make_intent("0xBuyerB", "4620000000", "1500000000000000000", "44"),
+        signature="0xbuy_b_signature",
+    )
+    sell_id = insert_sell_order(
+        account_name="seller_large",
+        amount=2.5,
+        min_price=3000,
+        intent_json=make_intent("0xSeller", "2500000000000000000", "7500000000", "55"),
+        signature="0xsell_signature",
+    )
+
+    result = orchestrator_server.apply_agent_decision(
+        {
+            "decisionStatus": "proposed_execution",
+            "sellOrderId": sell_id,
+            "matches": [
+                {
+                    "buyOrderId": buy_a,
+                    "filledAmount": 1,
+                    "unitPriceUsdc": 3050,
+                },
+                {
+                    "buyOrderId": buy_b,
+                    "filledAmount": 1.5,
+                    "unitPriceUsdc": 3060,
+                },
+            ],
+        }
+    )
+
+    with sqlite3.connect(orchestrator_server.EXECUTIONS_DB) as conn:
+        rows = conn.execute("SELECT execution_payload_json FROM executions ORDER BY id ASC").fetchall()
+    payloads = [json.loads(row[0]) for row in rows]
+
+    assert result["executionStatus"] == "proposed"
+    assert len(result["executionIds"]) == 2
+    assert len(rows) == 2
+    assert [payload["routeDetails"]["matchedIntentB"]["intent"]["user"] for payload in payloads] == [
+        "0xBuyerA",
+        "0xBuyerB",
+    ]
+    assert [payload["executeAmountIn"] for payload in payloads] == [
+        "1000000000000000000",
+        "1500000000000000000",
+    ]
+    assert [payload["routeDetails"]["matchedIntentB"]["executeAmountInB"] for payload in payloads] == [
+        "3100000000",
+        "4620000000",
+    ]
 
 
 def test_prepare_agent_task_skips_sell_order_with_open_execution() -> None:
