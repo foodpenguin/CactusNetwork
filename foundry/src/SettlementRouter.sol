@@ -33,7 +33,13 @@ contract SettlementRouter is EIP712, Ownable {
         "UserIntent(address user,address tokenIn,address tokenOut,uint256 amountIn,uint256 minAmountOut,uint256 deadline,bytes32 salt,bool allowPartialFill)"
     );
 
-    event IntentExecuted(bytes32 indexed intentHash, address indexed user);
+    event IntentExecuted(
+        bytes32 indexed intentHash,
+        address indexed user,
+        uint8 actionType,
+        uint256 executeAmountIn,
+        uint256 actualAmountOut
+    );
 
     constructor(address _vault, address _otcPool, address _uniswapRouter) EIP712("SettlementRouter", "1") Ownable(msg.sender) {
         vault = IntentVault(_vault);
@@ -103,9 +109,10 @@ contract SettlementRouter is EIP712, Ownable {
         // Post-execution slippage guard (pro-rata for partial fills)
         uint256 requiredMinAmountOut = (intent.minAmountOut * executeAmountIn + intent.amountIn - 1) / intent.amountIn;
         uint256 balanceAfter = IERC20(intent.tokenOut).balanceOf(intent.user);
-        require(balanceAfter - balanceBefore >= requiredMinAmountOut, "User A Slippage too high");
+        uint256 actualAmountOut = balanceAfter - balanceBefore;
+        require(actualAmountOut >= requiredMinAmountOut, "User A Slippage too high");
 
-        emit IntentExecuted(intentHash, intent.user);
+        emit IntentExecuted(intentHash, intent.user, actionType, executeAmountIn, actualAmountOut);
     }
 
     // ── ActionType 0: External DEX routing ──
@@ -191,9 +198,10 @@ contract SettlementRouter is EIP712, Ownable {
 
         // Slippage guard for user B
         uint256 balanceBAfter = IERC20(intentB.tokenOut).balanceOf(intentB.user);
-        require(balanceBAfter - balanceBBefore >= requiredMinAmountOutB, "User B Slippage too high");
+        uint256 actualAmountOutB = balanceBAfter - balanceBBefore;
+        require(actualAmountOutB >= requiredMinAmountOutB, "User B Slippage too high");
         
-        emit IntentExecuted(hashB, intentB.user);
+        emit IntentExecuted(hashB, intentB.user, 1, executeAmountInB, actualAmountOutB);
     }
 
     // ── ActionType 2: Treasury internalization ──
