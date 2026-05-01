@@ -12,6 +12,15 @@ contract DarkPoolOTC is Ownable {
 
     address public settlementRouter;
 
+    event AtomicSwapExecuted(
+        address indexed userA,
+        address indexed userB,
+        address tokenA,
+        uint256 amountA,
+        address tokenB,
+        uint256 amountB
+    );
+
     constructor() Ownable(msg.sender) {}
 
     function setSettlementRouter(address _router) external onlyOwner {
@@ -35,5 +44,7 @@ contract DarkPoolOTC is Ownable {
     ) external onlyRouter {
         IERC20(tokenA).safeTransfer(userB, amountA);
         IERC20(tokenB).safeTransfer(userA, amountB);
+
+        emit AtomicSwapExecuted(userA, userB, tokenA, amountA, tokenB, amountB);
     }
 }

@@ -1,0 +1,21 @@
+{
+  "intentA": {
+    "intent": {
+      "user": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      "tokenIn": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+      "tokenOut": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+      "amountIn": "1000000000000000000",
+      "minAmountOut": "3000000000",
+      "deadline": 1735689600,
+      "salt": "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b",
+      "allowPartialFill": false
+    },
+    "signature": "0xa1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b200"
+  },
+  "actionType": 2,
+  "executeAmountIn": "1000000000000000000",
+  "routeDetails": {
+    "matchedIntentB": null,
+    "treasuryAmountOut": "3100000000"
+  }
+}

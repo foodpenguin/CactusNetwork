@@ -21,6 +21,8 @@ contract ProtocolTreasury is Ownable {
     event KeeperRemoved(address indexed keeper);
     event RouterSet(address indexed router);
     event TokenWithdrawn(address indexed token, address indexed to, uint256 amount);
+    event IntentForwarded(address indexed keeper, address indexed user, uint8 actionType, uint256 executeAmountIn);
+    event TreasurySwapExecuted(address indexed tokenOut, address indexed to, uint256 amount);
     event ETHWithdrawn(address indexed to, uint256 amount);
 
     constructor(address _router) Ownable(msg.sender) {
@@ -78,6 +80,7 @@ contract ProtocolTreasury is Ownable {
         bytes calldata executionData,
         uint256 executeAmountIn
     ) external onlyKeeper {
+        emit IntentForwarded(msg.sender, intent.user, actionType, executeAmountIn);
         settlementRouter.executeIntent(intent, signature, actionType, executionData, executeAmountIn);
     }
 
@@ -87,7 +90,7 @@ contract ProtocolTreasury is Ownable {
         require(to != address(0), "Invalid recipient");
         require(amount > 0, "Amount must be > 0");
         IERC20(tokenOut).safeTransfer(to, amount);
-        emit TokenWithdrawn(tokenOut, to, amount);
+        emit TreasurySwapExecuted(tokenOut, to, amount);
     }
 
     receive() external payable {}
