@@ -23,6 +23,7 @@ REFRESH_INTERVAL_SECONDS = 15 * 60
 ORDER_TIMEOUT_MINUTES = int(os.getenv("ORCHESTRATOR_ORDER_TIMEOUT_MINUTES", "15"))
 MAX_ATTEMPTS = int(os.getenv("ORCHESTRATOR_MAX_ATTEMPTS", "3"))
 NON_ADMIN_WEIGHT_SEQUENCE = ["max", "max", "max", "max", "max", "plus", "plus", "free"]
+ORDER_AMOUNT_EPSILON = 1e-9
 
 
 def _now() -> datetime:
@@ -59,6 +60,36 @@ def _append_note(old_note: str | None, message: str) -> str:
     if old_note:
         return f"{old_note}\n{line}"
     return line
+
+
+def _normalized_remaining_amount(value: float) -> float:
+    """
+    將訂單剩餘量正規化。
+
+    輸入：
+    - `value`：扣量後的剩餘數量。
+
+    輸出：
+    - 若剩餘量只剩浮點誤差等級，回傳 `0.0`。
+    - 否則回傳非負數。
+    """
+    if abs(value) <= ORDER_AMOUNT_EPSILON:
+        return 0.0
+    return max(value, 0.0)
+
+
+def _remaining_status(value: float) -> str:
+    """
+    依剩餘量判斷訂單狀態。
+
+    輸入：
+    - `value`：扣量後的剩餘數量。
+
+    輸出：
+    - `filled`：剩餘量小於等於容差。
+    - `pending`：仍有實際剩餘量。
+    """
+    return "filled" if _normalized_remaining_amount(value) == 0.0 else "pending"
 
 
 def _ensure_databases() -> None:
@@ -1428,10 +1459,10 @@ def _validate_execution_matches(decision: dict[str, Any]) -> None:
             raise ValueError("unitPriceUsdc 超過買單最高接受價格")
         if float(sell_order["min_unit_price_usdc"]) > unit_price:
             raise ValueError("unitPriceUsdc 低於賣單最低接受價格")
-        if filled_amount > float(buy_order["remaining_amount"]):
+        if filled_amount > float(buy_order["remaining_amount"]) + ORDER_AMOUNT_EPSILON:
             raise ValueError("filledAmount 超過買單 remaining_amount")
         total_filled += filled_amount
-        if total_filled > sell_remaining:
+        if total_filled > sell_remaining + ORDER_AMOUNT_EPSILON:
             raise ValueError("matches 總 filledAmount 超過賣單 remaining_amount")
 
 
@@ -1541,7 +1572,8 @@ def _apply_matched_decision(decision: dict[str, Any]) -> dict[str, Any]:
     for match in normalized_matches:
         buy_order = match["buyOrder"]
         new_buy_remaining = float(buy_order["remaining_amount"]) - match["filledAmount"]
-        buy_status = "filled" if new_buy_remaining <= 0 else "pending"
+        normalized_buy_remaining = _normalized_remaining_amount(new_buy_remaining)
+        buy_status = _remaining_status(new_buy_remaining)
         buy_note = _append_note(
             buy_order["operation_note"],
             (
@@ -1557,21 +1589,22 @@ def _apply_matched_decision(decision: dict[str, Any]) -> dict[str, Any]:
                 SET remaining_amount = ?, status = ?, operation_note = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (max(new_buy_remaining, 0), buy_status, buy_note, now, match["buyOrderId"]),
+                (normalized_buy_remaining, buy_status, buy_note, now, match["buyOrderId"]),
             )
             conn.commit()
         buy_updates.append(
             {
                 "buyOrderId": match["buyOrderId"],
                 "filledAmount": match["filledAmount"],
-                "remainingAmount": max(new_buy_remaining, 0),
+                "remainingAmount": normalized_buy_remaining,
                 "status": buy_status,
                 "unitPriceUsdc": match["unitPriceUsdc"],
             }
         )
 
     new_sell_remaining = sell_remaining - total_filled
-    sell_status = "filled" if new_sell_remaining <= 0 else "pending"
+    normalized_sell_remaining = _normalized_remaining_amount(new_sell_remaining)
+    sell_status = _remaining_status(new_sell_remaining)
     sell_note = _append_note(
         sell_order["operation_note"],
         (
@@ -1587,7 +1620,7 @@ def _apply_matched_decision(decision: dict[str, Any]) -> dict[str, Any]:
             SET remaining_amount = ?, status = ?, operation_note = ?, updated_at = ?, queue_at = ?
             WHERE id = ?
             """,
-            (max(new_sell_remaining, 0), sell_status, sell_note, now, now, sell_order_id),
+            (normalized_sell_remaining, sell_status, sell_note, now, now, sell_order_id),
         )
         conn.commit()
 
@@ -1595,7 +1628,7 @@ def _apply_matched_decision(decision: dict[str, Any]) -> dict[str, Any]:
         "status": "decision_applied",
         "decisionStatus": "matched",
         "sellOrderId": sell_order_id,
-        "sellRemainingAmount": max(new_sell_remaining, 0),
+        "sellRemainingAmount": normalized_sell_remaining,
         "sellOrderStatus": sell_status,
         "totalFilledAmount": total_filled,
         "buyOrders": buy_updates,
@@ -1634,7 +1667,8 @@ def _apply_external_dex_confirmation(proposal: dict[str, Any], confirmation: dic
     sell_remaining = float(sell_order["remaining_amount"])
     applied_filled_amount = min(filled_amount, sell_remaining)
     new_sell_remaining = sell_remaining - applied_filled_amount
-    sell_status = "filled" if new_sell_remaining <= 0 else "pending"
+    normalized_sell_remaining = _normalized_remaining_amount(new_sell_remaining)
+    sell_status = _remaining_status(new_sell_remaining)
     now = _now().isoformat()
     agent_notes = str(confirmation.get("notes") or proposal.get("agentNotes") or "external dex execution confirmed").strip()
     tx_hash = confirmation.get("txHash") or confirmation.get("transactionHash")
@@ -1654,7 +1688,7 @@ def _apply_external_dex_confirmation(proposal: dict[str, Any], confirmation: dic
             SET remaining_amount = ?, status = ?, operation_note = ?, updated_at = ?, queue_at = ?
             WHERE id = ?
             """,
-            (max(new_sell_remaining, 0), sell_status, note, now, now, sell_order_id),
+            (normalized_sell_remaining, sell_status, note, now, now, sell_order_id),
         )
         conn.commit()
 
@@ -1663,7 +1697,7 @@ def _apply_external_dex_confirmation(proposal: dict[str, Any], confirmation: dic
         "decisionStatus": "matched",
         "executionType": "external_dex",
         "sellOrderId": sell_order_id,
-        "sellRemainingAmount": max(new_sell_remaining, 0),
+        "sellRemainingAmount": normalized_sell_remaining,
         "sellOrderStatus": sell_status,
         "totalFilledAmount": applied_filled_amount,
         "buyOrders": [],

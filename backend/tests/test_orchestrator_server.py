@@ -603,6 +603,44 @@ def test_confirm_execution_updates_remaining_amounts_and_statuses() -> None:
     assert "totalFilledAmount" in execution[2]
 
 
+def test_matched_decision_treats_float_dust_as_filled() -> None:
+    """測試拆單浮點誤差不會讓實際已成交完的賣單殘留 pending。"""
+    buy_id_1 = insert_buy_order(account_name="buyer_a", amount=1.4, max_price=3000)
+    buy_id_2 = insert_buy_order(account_name="buyer_b", amount=1.1, max_price=3000)
+    buy_id_3 = insert_buy_order(account_name="buyer_c", amount=0.9, max_price=3000)
+    sell_id = insert_sell_order(account_name="seller_a", amount=2.6, min_price=2900)
+
+    result = orchestrator_server.apply_agent_decision(
+        {
+            "decisionStatus": "matched",
+            "sellOrderId": sell_id,
+            "matches": [
+                {"buyOrderId": buy_id_1, "filledAmount": 1.4, "unitPriceUsdc": 2980},
+                {"buyOrderId": buy_id_2, "filledAmount": 1.1, "unitPriceUsdc": 2980},
+                {"buyOrderId": buy_id_3, "filledAmount": 0.1, "unitPriceUsdc": 2980},
+            ],
+        }
+    )
+
+    sell = fetch_one(
+        orchestrator_server.SELL_ORDERS_DB,
+        "SELECT remaining_amount, status FROM sell_orders WHERE id = ?",
+        (sell_id,),
+    )
+    buy_3 = fetch_one(
+        orchestrator_server.BUY_ORDERS_DB,
+        "SELECT remaining_amount, status FROM buy_orders WHERE id = ?",
+        (buy_id_3,),
+    )
+
+    assert result["sellRemainingAmount"] == 0
+    assert result["sellOrderStatus"] == "filled"
+    assert sell["remaining_amount"] == 0
+    assert sell["status"] == "filled"
+    assert buy_3["remaining_amount"] == 0.8
+    assert buy_3["status"] == "pending"
+
+
 def test_confirm_external_dex_execution_updates_only_sell_order() -> None:
     """測試外部 DEX confirmed 後，只扣賣單剩餘量，不需要本地買單。"""
     sell_id = insert_sell_order(account_name="seller_a", amount=100000000, min_price=0)
