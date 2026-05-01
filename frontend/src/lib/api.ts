@@ -1,4 +1,4 @@
-const BASE_URL = 'http://127.0.0.1:8000';
+const BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL ?? '').replace(/\/$/, '');
 
 let accessToken: string | null =
   typeof window !== 'undefined' ? localStorage.getItem('cactus_token') : null;
