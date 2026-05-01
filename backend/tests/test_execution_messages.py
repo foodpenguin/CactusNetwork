@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -5,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from scripts import api_server
+from scripts import blockchain_sync
 from scripts import execution_messages
 from scripts import orchestrator_server
 
@@ -13,6 +15,16 @@ from scripts import orchestrator_server
 def isolated_execution_message_databases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """每個 execution message 測試都使用暫存 DB。"""
     data_dir = tmp_path / "databases"
+    for key in (
+        "SP_TESTNET_RPC_URL",
+        "SEPOLIA_RPC_URL",
+        "RPC_URL",
+        "INTENT_VAULT_ADDRESS",
+        "SETTLEMENT_ROUTER_ADDRESS",
+        "PROTOCOL_TREASURY_ADDRESS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("ONCHAIN_PREFLIGHT_CHECKS", "disabled")
 
     monkeypatch.setattr(api_server, "DATA_DIR", data_dir)
     monkeypatch.setattr(api_server, "ACCOUNTS_DB", data_dir / "accounts.db")
@@ -160,6 +172,14 @@ def make_ready_dex_payload() -> dict:
     return payload
 
 
+def enable_required_onchain_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """啟用測試用鏈上預檢環境變數。"""
+    monkeypatch.setenv("ONCHAIN_PREFLIGHT_CHECKS", "required")
+    monkeypatch.setenv("SP_TESTNET_RPC_URL", "http://mock-rpc")
+    monkeypatch.setenv("INTENT_VAULT_ADDRESS", "0x4444444444444444444444444444444444444444")
+    monkeypatch.setenv("SETTLEMENT_ROUTER_ADDRESS", "0x5555555555555555555555555555555555555555")
+
+
 def fetch_order_remaining(db_path: Path, table_name: str, order_id: int) -> tuple[float, str]:
     """讀取訂單剩餘量與狀態。"""
     with sqlite3.connect(db_path) as conn:
@@ -191,6 +211,48 @@ def test_get_pending_execution_requests_returns_formatted_payload() -> None:
     assert request["payload"] == expected_payload
 
 
+def test_get_pending_execution_requests_strips_frontend_intent_metadata_and_prefixes_signature() -> None:
+    """測試送給 KeeperHub 的 payload 會移除前端輔助欄位並補齊 0x signature。"""
+    payload = make_ready_blockchain_payload()
+    payload["intentA"]["intent"].update(
+        {
+            "chainId": 11155111,
+            "tokenInChainId": 11155111,
+            "tokenOutChainId": 11155111,
+            "fee": 100,
+            "priceLimit": 0,
+            "swapper": "0xSeller",
+            "recipient": "0xSeller",
+            "deadline": "1999999999",
+        }
+    )
+    payload["intentA"]["signature"] = "sell_signature_without_prefix"
+    payload["routeDetails"]["matchedIntentB"]["intent"].update(
+        {
+            "chainId": 11155111,
+            "fee": 100,
+            "swapper": "0xBuyer",
+            "recipient": "0xBuyer",
+            "deadline": "1999999999",
+        }
+    )
+    payload["routeDetails"]["matchedIntentB"]["signature"] = "buy_signature_without_prefix"
+    execution_id, _, _ = create_proposed_execution(payload)
+
+    request = execution_messages.get_execution_request(execution_id)
+    intent_a = request["payload"]["intentA"]["intent"]
+    intent_b = request["payload"]["routeDetails"]["matchedIntentB"]["intent"]
+
+    assert set(intent_a) == set(execution_messages.REQUIRED_INTENT_FIELDS)
+    assert set(intent_b) == set(execution_messages.REQUIRED_INTENT_FIELDS)
+    assert intent_a["deadline"] == 1999999999
+    assert intent_b["deadline"] == 1999999999
+    assert isinstance(intent_a["deadline"], int)
+    assert isinstance(intent_b["deadline"], int)
+    assert request["payload"]["intentA"]["signature"] == "0xsell_signature_without_prefix"
+    assert request["payload"]["routeDetails"]["matchedIntentB"]["signature"] == "0xbuy_signature_without_prefix"
+
+
 def test_action_type_zero_requires_calldata_to_be_ready() -> None:
     """測試 DEX 類 payload 必須有 Calldata 才會被視為可送出。"""
     ready_payload = make_ready_dex_payload()
@@ -206,6 +268,74 @@ def test_action_type_zero_requires_calldata_to_be_ready() -> None:
     assert [request["executionId"] for request in requests] == [ready_execution_id]
     assert all_requests[0]["missingFields"] == []
     assert all_requests[1]["missingFields"] == ["routeDetails.Calldata"]
+
+
+def test_onchain_preflight_passes_when_both_intents_have_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """測試鏈上預檢會檢查 OTC 雙方 intent 的 vault 餘額與剩餘可成交量。"""
+    enable_required_onchain_preflight(monkeypatch)
+    payload = make_ready_blockchain_payload()
+    seen_execute_amounts: list[str] = []
+
+    def fake_capacity(intent: dict, execute_amount_in: object, **kwargs: object) -> dict:
+        seen_execute_amounts.append(str(execute_amount_in))
+        return {
+            "intentHash": "0x" + "12" * 32,
+            "user": intent["user"],
+            "tokenIn": intent["tokenIn"],
+            "executeAmountIn": str(execute_amount_in),
+            "amountIn": str(intent["amountIn"]),
+            "vaultBalance": str(execute_amount_in),
+            "filledAmountIn": "0",
+            "remainingAmountIn": str(intent["amountIn"]),
+            "hasEnoughVaultBalance": True,
+            "hasEnoughRemainingAmount": True,
+            "isExecutable": True,
+        }
+
+    monkeypatch.setattr(blockchain_sync, "read_intent_execution_capacity", fake_capacity)
+
+    result = execution_messages.check_execution_payload_onchain_preflight(payload)
+
+    assert result["status"] == "passed"
+    assert result["ready"] is True
+    assert [check["label"] for check in result["checks"]] == ["intentA", "routeDetails.matchedIntentB"]
+    assert seen_execute_amounts == ["1", "2900"]
+
+
+def test_send_execution_to_keeperhub_blocks_when_onchain_preflight_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """測試 vault 餘額不足時不會 POST 到 KeeperHub，execution 仍保持 proposed。"""
+    enable_required_onchain_preflight(monkeypatch)
+    execution_id, _, _ = create_proposed_execution(make_ready_dex_payload())
+
+    def fake_capacity(intent: dict, execute_amount_in: object, **kwargs: object) -> dict:
+        return {
+            "intentHash": "0x" + "34" * 32,
+            "user": intent["user"],
+            "tokenIn": intent["tokenIn"],
+            "executeAmountIn": str(execute_amount_in),
+            "amountIn": str(intent["amountIn"]),
+            "vaultBalance": "0",
+            "filledAmountIn": "0",
+            "remainingAmountIn": str(intent["amountIn"]),
+            "hasEnoughVaultBalance": False,
+            "hasEnoughRemainingAmount": True,
+            "isExecutable": False,
+        }
+
+    def fake_post_json(url: str, posted_payload: dict, timeout_seconds: float, extra_headers: dict) -> dict:
+        raise AssertionError("preflight failed execution should not be posted")
+
+    monkeypatch.setattr(blockchain_sync, "read_intent_execution_capacity", fake_capacity)
+    monkeypatch.setattr(execution_messages, "_post_json", fake_post_json)
+
+    with pytest.raises(ValueError, match="鏈上預檢失敗"):
+        execution_messages.send_execution_to_keeperhub(execution_id)
+
+    assert execution_messages.get_execution_request(execution_id)["status"] == "proposed"
 
 
 def test_dispatched_execution_can_be_confirmed_and_updates_orders_once() -> None:
@@ -234,8 +364,8 @@ def test_dispatched_execution_can_be_confirmed_and_updates_orders_once() -> None
     assert sell_status == "filled"
 
 
-def test_failed_execution_result_does_not_update_orders() -> None:
-    """測試區塊鏈端回報 failed 時不扣買賣單。"""
+def test_failed_execution_result_counts_attempt_without_deducting_orders() -> None:
+    """測試區塊鏈端回報 failed 時不扣買賣單，並讓賣單計一次失敗。"""
     execution_id, buy_id, sell_id = create_proposed_execution(make_ready_blockchain_payload())
     execution_messages.mark_execution_dispatched(execution_id)
 
@@ -246,12 +376,20 @@ def test_failed_execution_result_does_not_update_orders() -> None:
 
     buy_remaining, buy_status = fetch_order_remaining(orchestrator_server.BUY_ORDERS_DB, "buy_orders", buy_id)
     sell_remaining, sell_status = fetch_order_remaining(orchestrator_server.SELL_ORDERS_DB, "sell_orders", sell_id)
+    with sqlite3.connect(orchestrator_server.SELL_ORDERS_DB) as conn:
+        sell_attempts, sell_note = conn.execute(
+            "SELECT attempts, operation_note FROM sell_orders WHERE id = ?",
+            (sell_id,),
+        ).fetchone()
 
     assert result["executionStatus"] == "failed"
+    assert result["confirmResult"]["applyResult"]["status"] == "execution_failed_order_updated"
     assert buy_remaining == 2
     assert buy_status == "pending"
     assert sell_remaining == 1
     assert sell_status == "pending"
+    assert sell_attempts == 1
+    assert "execution_failed: reason=estimateGas failed" in sell_note
 
 
 def test_send_execution_to_keeperhub_posts_payload_and_accepts_confirmed_result(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -423,8 +561,10 @@ def test_wait_for_keeperhub_execution_result_polls_until_success(monkeypatch: py
     assert sell_status == "filled"
 
 
-def test_refresh_keeperhub_execution_results_marks_failed_without_deducting(monkeypatch: pytest.MonkeyPatch) -> None:
-    """測試 KeeperHub failed / error 只讓 execution 失敗，不扣訂單。"""
+def test_refresh_keeperhub_execution_results_marks_failed_and_counts_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """測試 KeeperHub failed / error 會讓 execution 失敗、不扣訂單，並計入賣單 attempts。"""
     execution_id, buy_id, sell_id = create_proposed_execution(make_ready_blockchain_payload())
     execution_messages.mark_execution_dispatched(
         execution_id,
@@ -445,6 +585,222 @@ def test_refresh_keeperhub_execution_results_marks_failed_without_deducting(monk
     assert buy_status == "pending"
     assert sell_remaining == 1
     assert sell_status == "pending"
+    with sqlite3.connect(orchestrator_server.SELL_ORDERS_DB) as conn:
+        attempts, note = conn.execute(
+            "SELECT attempts, operation_note FROM sell_orders WHERE id = ?",
+            (sell_id,),
+        ).fetchone()
+    assert attempts == 1
+    assert "execution_failed: reason=router reverted" in note
+
+
+def test_keeperhub_workflow_success_without_tx_hash_is_failed_and_counts_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """測試 KeeperHub workflow success 但沒有鏈上 tx hash 時，不可當 confirmed。"""
+    execution_id, buy_id, sell_id = create_proposed_execution(make_ready_blockchain_payload())
+    execution_messages.mark_execution_dispatched(
+        execution_id,
+        {"target": "keeperhub", "webhookResponse": {"executionId": "kh-no-tx", "status": "running"}},
+    )
+
+    def fake_get_json(url: str, timeout_seconds: float, extra_headers: dict) -> dict:
+        return {"id": "kh-no-tx", "status": "success", "nodeStatuses": [{"status": "success"}]}
+
+    monkeypatch.setattr(execution_messages, "_get_json", fake_get_json)
+
+    result = execution_messages.refresh_keeperhub_execution_results(limit=5)
+    buy_remaining, buy_status = fetch_order_remaining(orchestrator_server.BUY_ORDERS_DB, "buy_orders", buy_id)
+    sell_remaining, sell_status = fetch_order_remaining(orchestrator_server.SELL_ORDERS_DB, "sell_orders", sell_id)
+    with sqlite3.connect(orchestrator_server.SELL_ORDERS_DB) as conn:
+        attempts, note = conn.execute(
+            "SELECT attempts, operation_note FROM sell_orders WHERE id = ?",
+            (sell_id,),
+        ).fetchone()
+
+    assert result["finalized"][0]["executionStatus"] == "failed"
+    assert result["finalized"][0]["submitResult"]["confirmResult"]["failureReason"] == (
+        "KeeperHub workflow succeeded without chain tx hash"
+    )
+    assert buy_remaining == 2
+    assert buy_status == "pending"
+    assert sell_remaining == 1
+    assert sell_status == "pending"
+    assert attempts == 1
+    assert "execution_failed: reason=KeeperHub workflow succeeded without chain tx hash" in note
+
+
+def test_keeperhub_success_without_tx_hash_can_be_confirmed_by_onchain_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """測試 KeeperHub success 沒 tx hash 時，可用鏈上 filled amount 補做最終 confirmed。"""
+    execution_id, buy_id, sell_id = create_proposed_execution(make_ready_blockchain_payload())
+    execution_messages.mark_execution_dispatched(
+        execution_id,
+        {"target": "keeperhub", "webhookResponse": {"executionId": "kh-chain-confirmed", "status": "running"}},
+    )
+
+    def fake_get_json(url: str, timeout_seconds: float, extra_headers: dict) -> dict:
+        return {"id": "kh-chain-confirmed", "status": "success", "nodeStatuses": [{"status": "success"}]}
+
+    def fake_onchain_confirmation(payload: dict) -> dict:
+        return {
+            "status": "confirmed",
+            "confirmed": True,
+            "checks": [
+                {
+                    "label": "intentA",
+                    "intentHash": "0xintent-a",
+                    "filledAmountIn": "1",
+                    "requiredFilledAmountIn": "1",
+                    "hasFilledRequiredAmount": True,
+                },
+                {
+                    "label": "routeDetails.matchedIntentB",
+                    "intentHash": "0xintent-b",
+                    "filledAmountIn": "1450",
+                    "requiredFilledAmountIn": "1450",
+                    "hasFilledRequiredAmount": True,
+                },
+            ],
+        }
+
+    monkeypatch.setattr(execution_messages, "_get_json", fake_get_json)
+    monkeypatch.setattr(execution_messages, "check_execution_payload_onchain_confirmation", fake_onchain_confirmation)
+
+    result = execution_messages.refresh_keeperhub_execution_results(limit=5)
+    buy_remaining, buy_status = fetch_order_remaining(orchestrator_server.BUY_ORDERS_DB, "buy_orders", buy_id)
+    sell_remaining, sell_status = fetch_order_remaining(orchestrator_server.SELL_ORDERS_DB, "sell_orders", sell_id)
+
+    with sqlite3.connect(orchestrator_server.EXECUTIONS_DB) as conn:
+        confirmation_json = conn.execute(
+            "SELECT confirmation_json FROM executions WHERE execution_id = ?",
+            (execution_id,),
+        ).fetchone()[0]
+    confirmation = json.loads(confirmation_json)
+
+    assert result["finalized"][0]["executionStatus"] == "confirmed"
+    assert confirmation["onchainEvidence"]["confirmed"] is True
+    assert buy_remaining == 1
+    assert buy_status == "pending"
+    assert sell_remaining == 0
+    assert sell_status == "filled"
+
+
+def test_keeperhub_error_after_chain_execution_can_be_confirmed_by_onchain_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """測試 KeeperHub 後段 error 但鏈上已成交時，仍以鏈上狀態作 final confirmed。"""
+    execution_id, buy_id, sell_id = create_proposed_execution(make_ready_blockchain_payload())
+    execution_messages.mark_execution_dispatched(
+        execution_id,
+        {"target": "keeperhub", "webhookResponse": {"executionId": "kh-post-chain-error", "status": "running"}},
+    )
+
+    def fake_get_json(url: str, timeout_seconds: float, extra_headers: dict) -> dict:
+        return {
+            "id": "kh-post-chain-error",
+            "status": "error",
+            "errorContext": {
+                "error": "Webhook URL is required",
+                "lastSuccessfulNodeName": "Execute orders",
+            },
+        }
+
+    def fake_onchain_confirmation(payload: dict) -> dict:
+        return {
+            "status": "confirmed",
+            "confirmed": True,
+            "checks": [
+                {
+                    "label": "intentA",
+                    "intentHash": "0xintent-a",
+                    "filledAmountIn": "1",
+                    "requiredFilledAmountIn": "1",
+                    "hasFilledRequiredAmount": True,
+                },
+                {
+                    "label": "routeDetails.matchedIntentB",
+                    "intentHash": "0xintent-b",
+                    "filledAmountIn": "1450",
+                    "requiredFilledAmountIn": "1450",
+                    "hasFilledRequiredAmount": True,
+                },
+            ],
+        }
+
+    monkeypatch.setattr(execution_messages, "_get_json", fake_get_json)
+    monkeypatch.setattr(execution_messages, "check_execution_payload_onchain_confirmation", fake_onchain_confirmation)
+
+    result = execution_messages.refresh_keeperhub_execution_results(limit=5)
+    buy_remaining, buy_status = fetch_order_remaining(orchestrator_server.BUY_ORDERS_DB, "buy_orders", buy_id)
+    sell_remaining, sell_status = fetch_order_remaining(orchestrator_server.SELL_ORDERS_DB, "sell_orders", sell_id)
+
+    assert result["finalized"][0]["executionStatus"] == "confirmed"
+    assert buy_remaining == 1
+    assert buy_status == "pending"
+    assert sell_remaining == 0
+    assert sell_status == "filled"
+
+
+def test_failed_execution_marks_sell_invalid_at_attempt_limit() -> None:
+    """測試鏈上 execution 失敗達上限時，賣單會轉成 invalid，避免無限重試。"""
+    execution_id, buy_id, sell_id = create_proposed_execution(make_ready_blockchain_payload())
+    execution_messages.mark_execution_dispatched(execution_id)
+    with sqlite3.connect(orchestrator_server.SELL_ORDERS_DB) as conn:
+        conn.execute("UPDATE sell_orders SET attempts = ? WHERE id = ?", (orchestrator_server.MAX_ATTEMPTS - 1, sell_id))
+        conn.commit()
+
+    result = execution_messages.submit_execution_result(
+        execution_id,
+        {"status": "failed", "failure_reason": "vault balance too low"},
+    )
+    buy_remaining, buy_status = fetch_order_remaining(orchestrator_server.BUY_ORDERS_DB, "buy_orders", buy_id)
+    sell_remaining, sell_status = fetch_order_remaining(orchestrator_server.SELL_ORDERS_DB, "sell_orders", sell_id)
+    with sqlite3.connect(orchestrator_server.SELL_ORDERS_DB) as conn:
+        attempts, note = conn.execute(
+            "SELECT attempts, operation_note FROM sell_orders WHERE id = ?",
+            (sell_id,),
+        ).fetchone()
+
+    assert result["executionStatus"] == "failed"
+    assert result["confirmResult"]["applyResult"]["sellOrderStatus"] == "invalid"
+    assert buy_remaining == 2
+    assert buy_status == "pending"
+    assert sell_remaining == 1
+    assert sell_status == "invalid"
+    assert attempts == orchestrator_server.MAX_ATTEMPTS
+    assert "已達上限，標記 invalid" in note
+
+
+def test_refresh_marks_confirmed_result_failed_when_local_order_is_not_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """測試 KeeperHub success 但本地訂單已不可套用時，execution 會 failed 釋放鎖而不讓巡檢崩潰。"""
+    execution_id, buy_id, sell_id = create_proposed_execution(make_ready_blockchain_payload())
+    execution_messages.mark_execution_dispatched(
+        execution_id,
+        {"target": "keeperhub", "webhookResponse": {"id": "kh-late-success", "status": "running"}},
+    )
+    with sqlite3.connect(orchestrator_server.SELL_ORDERS_DB) as conn:
+        conn.execute("UPDATE sell_orders SET status = 'timeout' WHERE id = ?", (sell_id,))
+        conn.commit()
+
+    def fake_get_json(url: str, timeout_seconds: float, extra_headers: dict) -> dict:
+        return {"id": "kh-late-success", "status": "success", "txHash": "0xlate", "blockNumber": 88}
+
+    monkeypatch.setattr(execution_messages, "_get_json", fake_get_json)
+
+    result = execution_messages.refresh_keeperhub_execution_results(limit=5)
+    buy_remaining, buy_status = fetch_order_remaining(orchestrator_server.BUY_ORDERS_DB, "buy_orders", buy_id)
+    sell_remaining, sell_status = fetch_order_remaining(orchestrator_server.SELL_ORDERS_DB, "sell_orders", sell_id)
+
+    assert result["finalized"][0]["executionStatus"] == "failed"
+    assert "不是 pending 狀態" in result["finalized"][0]["submitResult"]["localApplyError"]
+    assert buy_remaining == 2
+    assert buy_status == "pending"
+    assert sell_remaining == 1
+    assert sell_status == "timeout"
 
 
 def test_refresh_keeperhub_split_executions_merge_into_same_sell_order(monkeypatch: pytest.MonkeyPatch) -> None:

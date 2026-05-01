@@ -21,6 +21,7 @@ def isolated_api_databases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(api_server, "ACCOUNTS_DB", data_dir / "accounts.db")
     monkeypatch.setattr(api_server, "BUY_ORDERS_DB", data_dir / "buy_orders.db")
     monkeypatch.setattr(api_server, "SELL_ORDERS_DB", data_dir / "sell_orders.db")
+    monkeypatch.setattr(api_server, "EXECUTIONS_DB", data_dir / "executions.db")
 
     api_server.SESSIONS.clear()
     api_server._init_databases()
@@ -68,6 +69,25 @@ def create_account_and_login() -> tuple[str, str]:
     )
     assert response.status_code == 200
     return account_name, response.json()["accessToken"]
+
+
+def valid_intent(user: str = "0x1111111111111111111111111111111111111111") -> dict:
+    """建立公開 API 測試用的完整鏈上 intent。"""
+    return {
+        "user": user,
+        "tokenIn": "0x2222222222222222222222222222222222222222",
+        "tokenOut": "0x3333333333333333333333333333333333333333",
+        "amountIn": "1000000000000000000",
+        "minAmountOut": "3000000000",
+        "deadline": 1999999999,
+        "salt": "0x" + "ab" * 32,
+        "allowPartialFill": True,
+    }
+
+
+def valid_signature() -> str:
+    """建立公開 API 測試用的 0x hex signature。"""
+    return "0x" + "cd" * 65
 
 
 def test_create_account_success_and_defaults() -> None:
@@ -163,6 +183,8 @@ def test_buy_and_sell_orders_require_login() -> None:
             "max_unit_price_usdc": 3000,
             "max_splits": 3,
             "max_fee_percent": 0.3,
+            "intent_json": valid_intent(),
+            "signature": valid_signature(),
         },
     )
     assert response.status_code == 401
@@ -175,6 +197,8 @@ def test_buy_and_sell_orders_require_login() -> None:
             "min_unit_price_usdc": 2900,
             "max_splits": 3,
             "max_fee_percent": 0.3,
+            "intent_json": valid_intent(),
+            "signature": valid_signature(),
         },
     )
     assert response.status_code == 401
@@ -194,6 +218,8 @@ def test_create_buy_order_success_and_database_defaults() -> None:
             "max_unit_price_usdc": 3000,
             "max_splits": 3,
             "max_fee_percent": 0.3,
+            "intent_json": valid_intent(),
+            "signature": valid_signature(),
         },
     )
 
@@ -232,6 +258,8 @@ def test_create_sell_order_success_and_database_defaults() -> None:
             "min_unit_price_usdc": 2900,
             "max_splits": 3,
             "max_fee_percent": 0.3,
+            "intent_json": valid_intent(),
+            "signature": valid_signature(),
         },
     )
 
@@ -261,26 +289,8 @@ def test_orders_can_store_frontend_intent_and_signature() -> None:
     """測試買單/賣單可保存前端 MetaMask intent_json 與 signature。"""
     clear_databases()
     _, token = create_account_and_login()
-    buy_intent = {
-        "user": "0xBuyer",
-        "tokenIn": "0xUSDC",
-        "tokenOut": "0xWETH",
-        "amountIn": "3000",
-        "minAmountOut": "1",
-        "deadline": 1999999999,
-        "salt": "0xbuy",
-        "allowPartialFill": True,
-    }
-    sell_intent = {
-        "user": "0xSeller",
-        "tokenIn": "0xWETH",
-        "tokenOut": "0xUSDC",
-        "amountIn": "1",
-        "minAmountOut": "2900",
-        "deadline": 1999999999,
-        "salt": "0xsell",
-        "allowPartialFill": True,
-    }
+    buy_intent = valid_intent("0x4444444444444444444444444444444444444444")
+    sell_intent = valid_intent("0x5555555555555555555555555555555555555555")
 
     buy_response = client.post(
         "/buy-orders",
@@ -292,7 +302,7 @@ def test_orders_can_store_frontend_intent_and_signature() -> None:
             "max_splits": 3,
             "max_fee_percent": 0.3,
             "intent_json": buy_intent,
-            "signature": "0xbuy_signature",
+            "signature": valid_signature(),
         },
     )
     sell_response = client.post(
@@ -305,7 +315,7 @@ def test_orders_can_store_frontend_intent_and_signature() -> None:
             "max_splits": 3,
             "max_fee_percent": 0.3,
             "intent_json": sell_intent,
-            "signature": "0xsell_signature",
+            "signature": valid_signature(),
         },
     )
 
@@ -328,14 +338,208 @@ def test_orders_can_store_frontend_intent_and_signature() -> None:
         ).fetchone()
 
     assert json.loads(buy_row[0]) == buy_intent
-    assert buy_row[1] == "0xbuy_signature"
+    assert buy_row[1] == valid_signature()
     assert json.loads(sell_row[0]) == sell_intent
-    assert sell_row[1] == "0xsell_signature"
+    assert sell_row[1] == valid_signature()
 
 
-def test_openapi_only_exposes_four_public_methods() -> None:
-    """測試目前前端文件只顯示四個公開方法。"""
+def test_create_order_rejects_incomplete_intent_before_insert() -> None:
+    """測試建單時會先擋掉不完整 intent，避免壞單進入中控。"""
+    clear_databases()
+    _, token = create_account_and_login()
+
+    response = client.post(
+        "/sell-orders",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "asset": "WETH",
+            "amount": 1,
+            "min_unit_price_usdc": 2900,
+            "max_splits": 3,
+            "max_fee_percent": 0.3,
+            "intent_json": {"probe": "not_chain_ready"},
+            "signature": valid_signature(),
+        },
+    )
+
+    assert response.status_code == 400
+    assert "intent_json 缺少必要欄位" in response.json()["detail"]
+
+    with sqlite3.connect(api_server.SELL_ORDERS_DB) as conn:
+        count = conn.execute("SELECT count(*) FROM sell_orders").fetchone()[0]
+    assert count == 0
+
+
+def test_create_order_requires_signature_with_intent() -> None:
+    """測試建單時 intent 與 signature 必須一起提供。"""
+    clear_databases()
+    _, token = create_account_and_login()
+
+    response = client.post(
+        "/buy-orders",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "asset": "WETH",
+            "amount": 1,
+            "max_unit_price_usdc": 3000,
+            "max_splits": 3,
+            "max_fee_percent": 0.3,
+            "intent_json": valid_intent(),
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "建立訂單必須同時提供 intent_json 與 signature"
+
+
+def test_user_can_list_own_orders() -> None:
+    """測試登入使用者可以查詢自己的買單與賣單狀態。"""
+    clear_databases()
+    account_name, token = create_account_and_login()
+
+    buy_response = client.post(
+        "/buy-orders",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "asset": "WETH",
+            "amount": 2,
+            "max_unit_price_usdc": 3000,
+            "max_splits": 4,
+            "max_fee_percent": 0.3,
+            "intent_json": valid_intent(),
+            "signature": valid_signature(),
+        },
+    )
+    sell_response = client.post(
+        "/sell-orders",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "asset": "WETH",
+            "amount": 1,
+            "min_unit_price_usdc": 2900,
+            "max_splits": 2,
+            "max_fee_percent": 0.2,
+            "intent_json": valid_intent(),
+            "signature": valid_signature(),
+        },
+    )
+
+    buy_list = client.get("/buy-orders", headers={"Authorization": f"Bearer {token}"})
+    sell_list = client.get("/sell-orders", headers={"Authorization": f"Bearer {token}"})
+
+    assert buy_list.status_code == 200
+    assert sell_list.status_code == 200
+    assert buy_list.json()[0]["buyOrderId"] == buy_response.json()["buyOrderId"]
+    assert buy_list.json()[0]["accountName"] == account_name
+    assert buy_list.json()[0]["operationNote"] == ""
+    assert sell_list.json()[0]["sellOrderId"] == sell_response.json()["sellOrderId"]
+    assert sell_list.json()[0]["accountName"] == account_name
+    assert sell_list.json()[0]["queueAt"] == sell_response.json()["queueAt"]
+
+
+def test_user_can_list_related_executions_for_sell_and_buy_orders() -> None:
+    """測試使用者可以查到自己賣單或買單相關的 execution 狀態。"""
+    clear_databases()
+    seller_name, seller_token = create_account_and_login()
+    _, buyer_token = create_account_and_login()
+
+    sell_response = client.post(
+        "/sell-orders",
+        headers={"Authorization": f"Bearer {seller_token}"},
+        json={
+            "asset": "WETH",
+            "amount": 1,
+            "min_unit_price_usdc": 2900,
+            "max_splits": 2,
+            "max_fee_percent": 0.2,
+            "intent_json": valid_intent(),
+            "signature": valid_signature(),
+        },
+    )
+    buy_response = client.post(
+        "/buy-orders",
+        headers={"Authorization": f"Bearer {buyer_token}"},
+        json={
+            "asset": "WETH",
+            "amount": 1,
+            "max_unit_price_usdc": 3000,
+            "max_splits": 2,
+            "max_fee_percent": 0.2,
+            "intent_json": valid_intent(),
+            "signature": valid_signature(),
+        },
+    )
+
+    api_server.EXECUTIONS_DB.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(api_server.EXECUTIONS_DB) as conn:
+        conn.execute(
+            """
+            CREATE TABLE executions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                execution_id TEXT NOT NULL,
+                task_id TEXT,
+                sell_order_id INTEGER NOT NULL,
+                proposal_json TEXT NOT NULL,
+                execution_payload_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                confirmation_json TEXT,
+                apply_result_json TEXT,
+                failure_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                confirmed_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO executions (
+                execution_id,
+                sell_order_id,
+                proposal_json,
+                execution_payload_json,
+                status,
+                failure_reason,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "execution:test:1",
+                sell_response.json()["sellOrderId"],
+                json.dumps({"matches": [{"buyOrderId": buy_response.json()["buyOrderId"], "filledAmount": 1}]}),
+                json.dumps({"actionType": 1}),
+                "failed",
+                "測試失敗原因",
+                "2026-05-01T00:00:00+00:00",
+                "2026-05-01T00:01:00+00:00",
+            ),
+        )
+        conn.commit()
+
+    seller_executions = client.get("/executions", headers={"Authorization": f"Bearer {seller_token}"})
+    buyer_executions = client.get("/executions", headers={"Authorization": f"Bearer {buyer_token}"})
+
+    assert seller_executions.status_code == 200
+    assert buyer_executions.status_code == 200
+    assert seller_executions.json()[0]["executionId"] == "execution:test:1"
+    assert seller_executions.json()[0]["relatedBy"] == "sell_order"
+    assert seller_executions.json()[0]["failureReason"] == "測試失敗原因"
+    assert buyer_executions.json()[0]["executionId"] == "execution:test:1"
+    assert buyer_executions.json()[0]["relatedBy"] == "buy_order"
+
+    assert seller_executions.json()[0]["sellOrderId"] == sell_response.json()["sellOrderId"]
+    assert seller_executions.json()[0]["status"] == "failed"
+    assert seller_name.startswith("test_user_")
+
+
+def test_openapi_exposes_public_methods() -> None:
+    """測試公開文件顯示帳號、訂單建立與查詢方法。"""
     response = client.get("/openapi.json")
     assert response.status_code == 200
     paths = response.json()["paths"]
-    assert set(paths.keys()) == {"/accounts", "/login", "/buy-orders", "/sell-orders"}
+    assert set(paths.keys()) == {"/accounts", "/login", "/buy-orders", "/sell-orders", "/executions"}
+    assert set(paths["/buy-orders"].keys()) == {"get", "post"}
+    assert set(paths["/sell-orders"].keys()) == {"get", "post"}
+    assert set(paths["/executions"].keys()) == {"get"}

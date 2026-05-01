@@ -699,8 +699,8 @@ def test_confirm_external_dex_execution_updates_only_sell_order() -> None:
     assert "external_dex_matched" in sell["operation_note"]
 
 
-def test_failed_execution_does_not_change_orders() -> None:
-    """測試 executor 回覆 failed 時，只更新 executions.db，不改買賣單。"""
+def test_failed_execution_counts_attempt_without_deducting_orders() -> None:
+    """測試 executor 回覆 failed 時不扣買賣單，但會讓賣單計一次失敗並回隊尾。"""
     buy_id = insert_buy_order(account_name="buyer_a", amount=10, max_price=3000)
     sell_id = insert_sell_order(account_name="seller_a", amount=1, min_price=2900)
 
@@ -729,17 +729,19 @@ def test_failed_execution_does_not_change_orders() -> None:
     )
     sell = fetch_one(
         orchestrator_server.SELL_ORDERS_DB,
-        "SELECT remaining_amount, status, operation_note FROM sell_orders WHERE id = ?",
+        "SELECT remaining_amount, status, attempts, operation_note FROM sell_orders WHERE id = ?",
         (sell_id,),
     )
 
     assert result["status"] == "execution_failed"
+    assert result["applyResult"]["status"] == "execution_failed_order_updated"
     assert buy["remaining_amount"] == 10
     assert buy["status"] == "pending"
     assert buy["operation_note"] == ""
     assert sell["remaining_amount"] == 1
     assert sell["status"] == "pending"
-    assert sell["operation_note"] == ""
+    assert sell["attempts"] == 1
+    assert "execution_failed: reason=executor simulation failed" in sell["operation_note"]
 
     with sqlite3.connect(orchestrator_server.EXECUTIONS_DB) as conn:
         execution = conn.execute(

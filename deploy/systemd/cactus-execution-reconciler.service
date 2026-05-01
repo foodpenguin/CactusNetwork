@@ -1,0 +1,16 @@
+[Unit]
+Description=CactusNetwork execution reconciler
+After=network-online.target cactus-public-api.service cactus-internal-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ark009770
+WorkingDirectory=/home/ark009770/CactusNetwork/backend
+EnvironmentFile=/home/ark009770/CactusNetwork/backend/.env
+ExecStart=/home/ark009770/CactusNetwork/backend/.venv/bin/python -m scripts.execution_reconciler loop --interval-seconds 30 --limit 20 --poll-interval-seconds 5 --max-wait-seconds 300 --timeout-seconds 60
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

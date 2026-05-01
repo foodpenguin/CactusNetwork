@@ -47,6 +47,7 @@ def run_matching_loop(
     candidate_limit: int = 5,
     interval_seconds: int = 15 * 60,
     max_cycles: int | None = None,
+    emit_json_lines: bool = False,
 ) -> list[dict[str, Any]]:
     """
     連續執行後端媒合流程。
@@ -56,9 +57,11 @@ def run_matching_loop(
     - `candidate_limit`：每輪最多提供幾筆候選買單。
     - `interval_seconds`：每輪間隔秒數。
     - `max_cycles`：最多執行幾輪；`None` 代表持續執行。
+    - `emit_json_lines`：是否每輪即時輸出一行 JSON，供 systemd / VM log 收集。
 
     輸出：
-    - 回傳已執行輪次的結果 list。若 `max_cycles=None`，通常不會自然回傳。
+    - 回傳已執行輪次的結果 list。
+    - 若 `max_cycles=None`，為避免常駐服務無限累積記憶體，結果不會持續保存在 list。
 
     副作用：
     - 週期性呼叫 `run_matching_drain()`，每輪會處理到沒有可派發賣單。
@@ -66,7 +69,11 @@ def run_matching_loop(
     results: list[dict[str, Any]] = []
     cycle = 0
     while max_cycles is None or cycle < max_cycles:
-        results.append(run_matching_drain(agent=agent, candidate_limit=candidate_limit))
+        result = run_matching_drain(agent=agent, candidate_limit=candidate_limit)
+        if max_cycles is not None:
+            results.append(result)
+        if emit_json_lines:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)
         cycle += 1
         if max_cycles is not None and cycle >= max_cycles:
             break
@@ -147,6 +154,7 @@ def run_cli() -> None:
     loop_parser.add_argument("--candidate-limit", type=int, default=5)
     loop_parser.add_argument("--interval-seconds", type=int, default=15 * 60)
     loop_parser.add_argument("--max-cycles", type=int)
+    loop_parser.add_argument("--emit-json-lines", action="store_true")
 
     args = parser.parse_args()
     if args.command == "once":
@@ -163,6 +171,7 @@ def run_cli() -> None:
             candidate_limit=args.candidate_limit,
             interval_seconds=args.interval_seconds,
             max_cycles=args.max_cycles,
+            emit_json_lines=args.emit_json_lines,
         )
     else:
         raise ValueError(f"未知 command：{args.command}")

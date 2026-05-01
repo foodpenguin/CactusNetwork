@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from scripts import api_server
 from scripts import blockchain_sync
 from scripts import execution_messages
+from scripts import execution_reconciler
 from scripts import internal_api
 from scripts import matching_service
 from scripts import orchestrator_server
@@ -186,6 +187,47 @@ def test_internal_api_defaults_to_grok_drain(monkeypatch: pytest.MonkeyPatch) ->
     }
 
 
+def test_internal_api_background_matching_job_completes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """測試 Grok 媒合可用背景 job 執行，避免外部 HTTP request 等到 timeout。"""
+
+    def fake_run_matching_drain(agent: str, candidate_limit: int, max_cycles: int):
+        return {
+            "status": "matching_drain_completed",
+            "agent": agent,
+            "stopReason": "no_processable_sell_order",
+            "cyclesRun": 0,
+            "cycles": [],
+            "candidateLimit": candidate_limit,
+            "maxCycles": max_cycles,
+        }
+
+    monkeypatch.setattr(matching_service, "run_matching_drain", fake_run_matching_drain)
+
+    create_response = client.post(
+        "/internal/matching/jobs",
+        headers=auth_headers(),
+        json={"agent": "grok", "candidate_limit": 7, "max_cycles": 9},
+    )
+    job_id = create_response.json()["jobId"]
+
+    assert create_response.status_code == 200
+    assert create_response.json()["status"] in {"queued", "running", "completed"}
+
+    for _ in range(30):
+        get_response = client.get(f"/internal/matching/jobs/{job_id}", headers=auth_headers())
+        assert get_response.status_code == 200
+        body = get_response.json()
+        if body["status"] == "completed":
+            break
+    else:
+        raise AssertionError("background matching job did not complete")
+
+    assert body["result"]["status"] == "matching_drain_completed"
+    assert body["result"]["agent"] == "grok"
+    assert body["result"]["candidateLimit"] == 7
+    assert body["result"]["maxCycles"] == 9
+
+
 def test_internal_api_full_backend_to_chain_message_flow() -> None:
     """測試 internal API 可跑媒合、取 payload、dispatch、回報 confirmed。"""
     buy_id = insert_buy_order()
@@ -235,6 +277,38 @@ def test_internal_api_full_backend_to_chain_message_flow() -> None:
     assert result_response.json()["executionStatus"] == "confirmed"
     assert buy == (0, "filled")
     assert sell == (0, "filled")
+
+
+def test_internal_api_onchain_confirm_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """測試 internal API 可呼叫鏈上確認接口作為 execution 最終判定。"""
+    captured: dict[str, object] = {}
+
+    def fake_confirm(execution_id: str, tx_hash=None, raw_keeperhub_result=None) -> dict:
+        captured["execution_id"] = execution_id
+        captured["tx_hash"] = tx_hash
+        captured["raw_keeperhub_result"] = raw_keeperhub_result
+        return {
+            "status": "onchain_confirmation_accepted",
+            "executionId": execution_id,
+            "executionStatus": "confirmed",
+            "onchainEvidence": {"confirmed": True},
+        }
+
+    monkeypatch.setattr(execution_messages, "confirm_execution_from_onchain", fake_confirm)
+
+    response = client.post(
+        "/internal/executions/execution-123/onchain/confirm",
+        headers=auth_headers(),
+        json={"tx_hash": "0xabc", "raw_keeperhub_result": {"status": "success"}},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["executionStatus"] == "confirmed"
+    assert captured == {
+        "execution_id": "execution-123",
+        "tx_hash": "0xabc",
+        "raw_keeperhub_result": {"status": "success"},
+    }
 
 
 def test_internal_api_failed_result_does_not_update_orders() -> None:
@@ -387,4 +461,81 @@ def test_internal_api_can_refresh_keeperhub_results(monkeypatch: pytest.MonkeyPa
         "timeout_seconds": 11,
         "status_api_base": "https://example.com/executions",
         "status_headers": {"Authorization": "Bearer status-token"},
+    }
+
+
+def test_internal_api_can_reconcile_executions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """測試 internal API 可觸發 execution 自動收尾巡檢。"""
+    captured: dict[str, object] = {}
+
+    def fake_reconcile_keeperhub_executions(
+        limit,
+        dispatch_ready,
+        expire_invalid,
+        refresh_dispatched,
+        wait_for_final_result,
+        webhook_url,
+        timeout_seconds,
+        webhook_headers,
+        poll_interval_seconds,
+        max_wait_seconds,
+        status_api_base,
+        status_headers,
+    ):
+        captured["limit"] = limit
+        captured["dispatch_ready"] = dispatch_ready
+        captured["expire_invalid"] = expire_invalid
+        captured["refresh_dispatched"] = refresh_dispatched
+        captured["wait_for_final_result"] = wait_for_final_result
+        captured["webhook_url"] = webhook_url
+        captured["timeout_seconds"] = timeout_seconds
+        captured["webhook_headers"] = webhook_headers
+        captured["poll_interval_seconds"] = poll_interval_seconds
+        captured["max_wait_seconds"] = max_wait_seconds
+        captured["status_api_base"] = status_api_base
+        captured["status_headers"] = status_headers
+        return {
+            "status": "execution_reconcile_completed",
+            "expired": [],
+            "dispatched": [{"executionId": "execution:1:match:1", "executionStatus": "confirmed"}],
+            "summary": {"dispatchedCount": 1},
+        }
+
+    monkeypatch.setattr(execution_reconciler, "reconcile_keeperhub_executions", fake_reconcile_keeperhub_executions)
+
+    response = client.post(
+        "/internal/executions/reconcile",
+        headers=auth_headers(),
+        json={
+            "limit": 4,
+            "dispatch_ready": True,
+            "expire_invalid": True,
+            "refresh_dispatched": True,
+            "wait_for_final_result": True,
+            "webhook_url": "https://example.com/webhook",
+            "timeout_seconds": 13,
+            "webhook_headers": {"Authorization": "Bearer webhook"},
+            "poll_interval_seconds": 2,
+            "max_wait_seconds": 25,
+            "status_api_base": "https://example.com/executions",
+            "status_headers": {"Authorization": "Bearer status"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "execution_reconcile_completed"
+    assert response.json()["summary"]["dispatchedCount"] == 1
+    assert captured == {
+        "limit": 4,
+        "dispatch_ready": True,
+        "expire_invalid": True,
+        "refresh_dispatched": True,
+        "wait_for_final_result": True,
+        "webhook_url": "https://example.com/webhook",
+        "timeout_seconds": 13,
+        "webhook_headers": {"Authorization": "Bearer webhook"},
+        "poll_interval_seconds": 2,
+        "max_wait_seconds": 25,
+        "status_api_base": "https://example.com/executions",
+        "status_headers": {"Authorization": "Bearer status"},
     }

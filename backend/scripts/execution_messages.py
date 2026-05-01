@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 
+from scripts import blockchain_sync
 from scripts import orchestrator_server
 
 
@@ -26,6 +27,7 @@ DEFAULT_KEEPERHUB_TIMEOUT_SECONDS = 60.0
 KEEPERHUB_WAITING_STATUSES = {"pending", "running", "queued", "waiting"}
 KEEPERHUB_SUCCESS_STATUSES = {"success", "succeeded", "completed", "complete", "confirmed"}
 KEEPERHUB_FAILED_STATUSES = {"error", "failed", "failure", "cancelled", "canceled"}
+ONCHAIN_PREFLIGHT_ENV = "ONCHAIN_PREFLIGHT_CHECKS"
 
 
 def get_pending_execution_requests(limit: int = 20, ready_only: bool = False) -> list[dict[str, Any]]:
@@ -177,6 +179,65 @@ def submit_execution_result(execution_id: str, result: dict[str, Any]) -> dict[s
     }
 
 
+def confirm_execution_from_onchain(
+    execution_id: str,
+    tx_hash: str | None = None,
+    raw_keeperhub_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    讀取鏈上狀態並以鏈上資料作為 execution 最終判定。
+
+    輸入：
+    - `execution_id`：本地 execution id。
+    - `tx_hash`：可選；KeeperHub 或 executor 若有提供交易 hash，可一併記錄。
+    - `raw_keeperhub_result`：可選；KeeperHub 原始成功回覆，用於除錯留存。
+
+    輸出：
+    - 鏈上 filled amount 足夠時，回傳 `onchain_confirmation_accepted` 並正式 confirmed。
+    - 鏈上資料不足或設定缺失時，回傳 `onchain_confirmation_not_found`，不更新本地訂單。
+
+    副作用：
+    - confirmed 時會呼叫 `submit_execution_result()`，此時才扣除本地買賣單剩餘量。
+    - not_found 時只回報原因，不把 execution 標成 failed，讓呼叫端可稍後重查。
+    """
+    row = _fetch_execution_row(execution_id)
+    if row is None:
+        raise ValueError(f"execution_id={execution_id} 不存在")
+    if row["status"] in FINAL_EXECUTION_STATUSES:
+        return {
+            "status": "already_finalized",
+            "executionId": execution_id,
+            "executionStatus": row["status"],
+            "executionRequest": _execution_row_to_request(row),
+        }
+    if row["status"] not in ("proposed", "dispatched"):
+        raise ValueError(f"execution_id={execution_id} 目前狀態不是 proposed 或 dispatched")
+
+    confirmation_result = _build_onchain_confirmation_result(
+        execution_id,
+        tx_hash=tx_hash,
+        raw_keeperhub_result=raw_keeperhub_result,
+    )
+    if confirmation_result["status"] != "confirmed":
+        return {
+            "status": "onchain_confirmation_not_found",
+            "executionId": execution_id,
+            "executionStatus": row["status"],
+            "failureReason": confirmation_result.get("failure_reason") or confirmation_result.get("failureReason"),
+            "onchainEvidence": confirmation_result.get("onchainEvidence"),
+            "confirmationCandidate": confirmation_result,
+        }
+
+    submit_result = _submit_final_keeperhub_result(execution_id, confirmation_result)
+    return {
+        "status": "onchain_confirmation_accepted",
+        "executionId": execution_id,
+        "executionStatus": submit_result["executionStatus"],
+        "submitResult": submit_result,
+        "onchainEvidence": confirmation_result.get("onchainEvidence"),
+    }
+
+
 def send_execution_to_keeperhub(
     execution_id: str,
     webhook_url: str | None = None,
@@ -187,6 +248,7 @@ def send_execution_to_keeperhub(
     max_wait_seconds: float = 300.0,
     status_api_base: str | None = None,
     status_headers: dict[str, str] | None = None,
+    run_onchain_preflight: bool = True,
 ) -> dict[str, Any]:
     """
     將一筆 ready execution payload 送到 KeeperHub webhook，並回收 webhook 結果。
@@ -215,6 +277,12 @@ def send_execution_to_keeperhub(
         raise ValueError(f"execution_id={execution_id} 目前狀態不是 proposed")
     if not request["readyForExecutor"]:
         raise ValueError(f"execution_id={execution_id} 缺少必要欄位：{request['missingFields']}")
+    if run_onchain_preflight:
+        preflight = check_execution_payload_onchain_preflight(request["payload"])
+        if preflight["status"] == "failed":
+            raise ValueError(f"鏈上預檢失敗：{preflight['failureReason']}")
+        if preflight["status"] == "error":
+            raise ValueError(f"鏈上預檢錯誤：{preflight['failureReason']}")
 
     target_url = _resolve_keeperhub_webhook_url(webhook_url)
     keeperhub_response = _post_json(target_url, request["payload"], timeout_seconds, webhook_headers or {})
@@ -255,6 +323,7 @@ def send_execution_to_keeperhub(
             "dispatchResult": dispatch,
         }
 
+    final_result = _resolve_keeperhub_final_result(execution_id, final_result)
     submit_result = submit_execution_result(execution_id, final_result)
     return {
         "status": "keeperhub_result_accepted",
@@ -263,6 +332,169 @@ def send_execution_to_keeperhub(
         "keeperhub": keeperhub_response,
         "dispatchResult": dispatch,
         "submitResult": submit_result,
+    }
+
+
+def check_execution_payload_onchain_preflight(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    在送 KeeperHub 前讀鏈上狀態，確認 vault 餘額與 intent 剩餘額度足夠。
+
+    輸入：
+    - `payload`：嚴格 execution payload。
+
+    輸出：
+    - `status = passed`：鏈上檢查通過，可送 KeeperHub。
+    - `status = failed`：查詢成功但餘額或 remaining 不足，不應送出。
+    - `status = error`：RPC 或格式錯誤，暫不送出，避免誤判。
+    - `status = skipped`：未啟用或缺少必要 env，維持舊流程。
+
+    副作用：
+    - 啟用時會發送 JSON-RPC `eth_call`。
+    - 不送交易，不改本地或鏈上狀態。
+    """
+    mode = _onchain_preflight_mode()
+    if mode == "disabled":
+        return {"status": "skipped", "ready": True, "reason": "ONCHAIN_PREFLIGHT_CHECKS disabled", "checks": []}
+
+    config = _onchain_preflight_config()
+    missing_config = [key for key, value in config.items() if key in {"rpcUrl", "vaultAddress", "routerAddress"} and not value]
+    if missing_config:
+        if mode == "required":
+            return {
+                "status": "error",
+                "ready": False,
+                "failureReason": "鏈上預檢缺少設定：" + ", ".join(missing_config),
+                "checks": [],
+            }
+        return {
+            "status": "skipped",
+            "ready": True,
+            "reason": "鏈上預檢 auto 模式缺少設定：" + ", ".join(missing_config),
+            "checks": [],
+        }
+
+    checks: list[dict[str, Any]] = []
+    try:
+        checks.append(
+            _check_intent_capacity(
+                "intentA",
+                (payload.get("intentA") or {}).get("intent"),
+                payload.get("executeAmountIn"),
+                config,
+            )
+        )
+        route_details = payload.get("routeDetails") or {}
+        matched_intent_b = route_details.get("matchedIntentB")
+        if payload.get("actionType") == 1 and isinstance(matched_intent_b, dict):
+            checks.append(
+                _check_intent_capacity(
+                    "routeDetails.matchedIntentB",
+                    matched_intent_b.get("intent"),
+                    matched_intent_b.get("executeAmountInB"),
+                    config,
+                )
+            )
+        if payload.get("actionType") == 2:
+            checks.append(_check_treasury_capacity(payload, config))
+    except Exception as exc:
+        return {
+            "status": "error",
+            "ready": False,
+            "failureReason": str(exc),
+            "checks": checks,
+        }
+
+    failed_checks = [check for check in checks if not check.get("isExecutable", False)]
+    if failed_checks:
+        return {
+            "status": "failed",
+            "ready": False,
+            "failureReason": _format_onchain_preflight_failure(failed_checks),
+            "checks": checks,
+        }
+    return {
+        "status": "passed",
+        "ready": True,
+        "checks": checks,
+    }
+
+
+def check_execution_payload_onchain_confirmation(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    在 KeeperHub 回覆後讀鏈上狀態，確認本次 payload 是否已被 SettlementRouter 記帳。
+
+    輸入：
+    - `payload`：嚴格 execution payload。
+
+    輸出：
+    - `status = confirmed`：每個需要成交的 intent，其 `filledAmountIn` 都已達本次執行量。
+    - `status = failed`：RPC 可讀，但鏈上 filled amount 尚未達標。
+    - `status = error`：缺少 RPC / Router 設定或 payload 格式無法檢查。
+
+    副作用：
+    - 發送 JSON-RPC `eth_call` 讀取 `SettlementRouter.filledAmountIn(intentHash)`。
+    - 不送交易、不改鏈上狀態。
+    """
+    config = _onchain_preflight_config()
+    missing_config = [key for key, value in config.items() if key in {"rpcUrl", "routerAddress"} and not value]
+    if missing_config:
+        return {
+            "status": "error",
+            "confirmed": False,
+            "failureReason": "鏈上確認缺少設定：" + ", ".join(missing_config),
+            "checks": [],
+        }
+
+    missing_fields = _missing_blockchain_payload_fields(payload)
+    if missing_fields:
+        return {
+            "status": "error",
+            "confirmed": False,
+            "failureReason": "鏈上確認 payload 缺少欄位：" + ", ".join(missing_fields),
+            "checks": [],
+        }
+
+    checks: list[dict[str, Any]] = []
+    try:
+        checks.append(
+            _check_intent_fill_confirmation(
+                "intentA",
+                (payload.get("intentA") or {}).get("intent"),
+                payload.get("executeAmountIn"),
+                config,
+            )
+        )
+        route_details = payload.get("routeDetails") or {}
+        matched_intent_b = route_details.get("matchedIntentB")
+        if payload.get("actionType") == 1 and isinstance(matched_intent_b, dict):
+            checks.append(
+                _check_intent_fill_confirmation(
+                    "routeDetails.matchedIntentB",
+                    matched_intent_b.get("intent"),
+                    matched_intent_b.get("executeAmountInB"),
+                    config,
+                )
+            )
+    except Exception as exc:
+        return {
+            "status": "error",
+            "confirmed": False,
+            "failureReason": str(exc),
+            "checks": checks,
+        }
+
+    failed_checks = [check for check in checks if not check.get("hasFilledRequiredAmount", False)]
+    if failed_checks:
+        return {
+            "status": "failed",
+            "confirmed": False,
+            "failureReason": _format_onchain_confirmation_failure(failed_checks),
+            "checks": checks,
+        }
+    return {
+        "status": "confirmed",
+        "confirmed": True,
+        "checks": checks,
     }
 
 
@@ -388,7 +620,8 @@ def refresh_keeperhub_execution_results(
             )
             continue
 
-        submit_result = submit_execution_result(execution_id, normalized_result)
+        normalized_result = _resolve_keeperhub_final_result(execution_id, normalized_result)
+        submit_result = _submit_final_keeperhub_result(execution_id, normalized_result)
         result["finalized"].append(
             {
                 "executionId": execution_id,
@@ -492,7 +725,8 @@ def wait_for_keeperhub_execution_result(
         last_status_body = status_body
         normalized_result = _extract_keeperhub_execution_result(status_body)
         if normalized_result is not None:
-            submit_result = submit_execution_result(execution_id, normalized_result)
+            normalized_result = _resolve_keeperhub_final_result(execution_id, normalized_result)
+            submit_result = _submit_final_keeperhub_result(execution_id, normalized_result)
             return {
                 "status": "keeperhub_final_result_accepted",
                 "executionId": execution_id,
@@ -514,6 +748,37 @@ def wait_for_keeperhub_execution_result(
             }
 
         time.sleep(min(safe_poll_interval, safe_max_wait - elapsed_seconds))
+
+
+def _submit_final_keeperhub_result(execution_id: str, normalized_result: dict[str, Any]) -> dict[str, Any]:
+    """
+    套用 KeeperHub 最終結果，若本地狀態已無法 confirmed，改以 failed 收尾釋放鎖。
+
+    輸入：
+    - `execution_id`：本地 execution id。
+    - `normalized_result`：KeeperHub success / failed 正規化結果。
+
+    輸出：
+    - 回傳 `submit_execution_result()` 的結果。
+    - 若 KeeperHub 回 success 但本地訂單已 timeout / invalid / filled，會回傳 failed 結果並附上 `localApplyError`。
+
+    副作用：
+    - confirmed 可套用時正式扣單。
+    - confirmed 不可套用或 failed 時，將 execution 標成 failed，避免永久鎖住買賣單。
+    """
+    try:
+        return submit_execution_result(execution_id, normalized_result)
+    except ValueError as exc:
+        fallback = submit_execution_result(
+            execution_id,
+            {
+                "status": "failed",
+                "failure_reason": f"KeeperHub final result could not be applied locally: {exc}",
+                "raw_keeperhub_result": normalized_result,
+            },
+        )
+        fallback["localApplyError"] = str(exc)
+        return fallback
 
 
 def run_cli() -> None:
@@ -651,11 +916,109 @@ def _strict_blockchain_payload(raw_payload: dict[str, Any]) -> dict[str, Any]:
     else:
         payload = raw_payload
 
-    if isinstance(payload.get("routeDetails"), dict) and "Calldata" not in payload["routeDetails"]:
-        payload = dict(payload)
-        payload["routeDetails"] = dict(payload["routeDetails"])
-        payload["routeDetails"]["Calldata"] = None
-    return payload
+    route_details = payload.get("routeDetails") if isinstance(payload.get("routeDetails"), dict) else {}
+    matched_intent_b = route_details.get("matchedIntentB")
+
+    strict_route_details: dict[str, Any] = {
+        "Calldata": route_details.get("Calldata"),
+        "matchedIntentB": None,
+        "treasuryAmountOut": route_details.get("treasuryAmountOut"),
+    }
+    if isinstance(matched_intent_b, dict):
+        strict_route_details["matchedIntentB"] = {
+            "intent": _strict_intent(matched_intent_b.get("intent")),
+            "signature": _normalize_hex_string(matched_intent_b.get("signature")),
+            "executeAmountInB": _string_or_none(matched_intent_b.get("executeAmountInB")),
+        }
+
+    intent_a = payload.get("intentA") if isinstance(payload.get("intentA"), dict) else {}
+    return {
+        "intentA": {
+            "intent": _strict_intent(intent_a.get("intent")),
+            "signature": _normalize_hex_string(intent_a.get("signature")),
+        },
+        "actionType": payload.get("actionType"),
+        "executeAmountIn": _string_or_none(payload.get("executeAmountIn")),
+        "routeDetails": strict_route_details,
+    }
+
+
+def _strict_intent(value: Any) -> dict[str, Any] | None:
+    """
+    將 intent 正規化成鏈上端允許的 8 個欄位。
+
+    輸入：
+    - `value`：可能含前端輔助欄位的 intent dict。
+
+    輸出：
+    - 只包含 `user`、`tokenIn`、`tokenOut`、`amountIn`、`minAmountOut`、`deadline`、`salt`、`allowPartialFill`。
+    - 輸入不是 dict 時回傳 `None`。
+    """
+    if not isinstance(value, dict):
+        return None
+    return {
+        "user": value.get("user"),
+        "tokenIn": value.get("tokenIn"),
+        "tokenOut": value.get("tokenOut"),
+        "amountIn": _string_or_none(value.get("amountIn")),
+        "minAmountOut": _string_or_none(value.get("minAmountOut")),
+        "deadline": _integer_or_none(value.get("deadline")),
+        "salt": _normalize_hex_string(value.get("salt")),
+        "allowPartialFill": value.get("allowPartialFill"),
+    }
+
+
+def _normalize_hex_string(value: Any) -> str | None:
+    """
+    正規化 hex 字串，缺少 `0x` 時自動補上。
+
+    輸入：
+    - `value`：signature、salt 或 calldata 類 hex 值。
+
+    輸出：
+    - 空值回傳 `None`。
+    - 既有 `0x` 前綴時原樣回傳。
+    - 純 hex 字串補成 `0x...`。
+    """
+    if value in (None, ""):
+        return None
+    text = str(value)
+    if text.startswith(("0x", "0X")):
+        return "0x" + text[2:]
+    return f"0x{text}"
+
+
+def _integer_or_none(value: Any) -> int | None:
+    """
+    將 JSON payload 中應為整數的欄位正規化。
+
+    輸入：
+    - `value`：可能是 int 或整數字串。
+
+    輸出：
+    - 可轉換時回傳 `int`；空值或不可轉換時回傳 `None`。
+    """
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _string_or_none(value: Any) -> str | None:
+    """
+    將 JSON 數值欄位轉成字串。
+
+    輸入：
+    - `value`：任意值。
+
+    輸出：
+    - 空值回傳 `None`，其他值回傳 `str(value)`。
+    """
+    if value in (None, ""):
+        return None
+    return str(value)
 
 
 def _missing_blockchain_payload_fields(payload: dict[str, Any]) -> list[str]:
@@ -721,6 +1084,277 @@ def _missing_blockchain_payload_fields(payload: dict[str, Any]) -> list[str]:
     return missing
 
 
+def _onchain_preflight_mode() -> str:
+    """
+    取得鏈上預檢模式。
+
+    輸入：
+    - 無；讀 `.env` / 環境變數 `ONCHAIN_PREFLIGHT_CHECKS`。
+
+    輸出：
+    - `disabled`：不做鏈上預檢。
+    - `auto`：RPC、Vault、Router 設定齊全才做檢查。
+    - `required`：設定缺失或 RPC 錯誤都視為不可送出。
+    """
+    _load_env()
+    raw_mode = str(os.getenv(ONCHAIN_PREFLIGHT_ENV, "auto")).strip().lower()
+    if raw_mode in {"0", "false", "off", "disabled", "disable"}:
+        return "disabled"
+    if raw_mode in {"1", "true", "on", "enabled", "enable", "required", "require"}:
+        return "required"
+    return "auto"
+
+
+def _onchain_preflight_config() -> dict[str, str | None]:
+    """
+    取得鏈上預檢需要的 RPC 與合約地址設定。
+
+    輸入：
+    - 無；讀 `.env` / 環境變數。
+
+    輸出：
+    - `rpcUrl`
+    - `vaultAddress`
+    - `routerAddress`
+    - `treasuryAddress`
+    """
+    blockchain_sync.load_env_file()
+    return {
+        "rpcUrl": os.getenv("SP_TESTNET_RPC_URL") or os.getenv("SEPOLIA_RPC_URL") or os.getenv("RPC_URL"),
+        "vaultAddress": os.getenv("INTENT_VAULT_ADDRESS"),
+        "routerAddress": os.getenv("SETTLEMENT_ROUTER_ADDRESS"),
+        "treasuryAddress": os.getenv("PROTOCOL_TREASURY_ADDRESS"),
+    }
+
+
+def _check_intent_capacity(
+    label: str,
+    intent: Any,
+    execute_amount_in: Any,
+    config: dict[str, str | None],
+) -> dict[str, Any]:
+    """
+    讀取單側 intent 的 vault balance 與 filledAmountIn 並判斷是否足夠。
+
+    輸入：
+    - `label`：檢查對象名稱，例如 `intentA`。
+    - `intent`：UserIntent dict。
+    - `execute_amount_in`：本次要消耗的 tokenIn raw amount。
+    - `config`：RPC / Vault / Router 設定。
+
+    輸出：
+    - 回傳單側鏈上容量檢查結果。
+    """
+    if not isinstance(intent, dict):
+        raise ValueError(f"{label}.intent 不是 object")
+    state = blockchain_sync.read_intent_execution_capacity(
+        intent,
+        execute_amount_in,
+        rpc_url=config["rpcUrl"],
+        vault_address=config["vaultAddress"],
+        router_address=config["routerAddress"],
+    )
+    return {
+        "label": label,
+        **state,
+    }
+
+
+def _check_intent_fill_confirmation(
+    label: str,
+    intent: Any,
+    execute_amount_in: Any,
+    config: dict[str, str | None],
+) -> dict[str, Any]:
+    """
+    讀取單側 intent 的 filledAmountIn，判斷鏈上是否已記錄本次成交量。
+
+    輸入：
+    - `label`：檢查對象名稱，例如 `intentA`。
+    - `intent`：UserIntent dict。
+    - `execute_amount_in`：本次應成交的 tokenIn raw amount。
+    - `config`：RPC / Router 設定。
+
+    輸出：
+    - 回傳 intent hash、目前 filled amount、要求成交量，以及是否已達標。
+    """
+    if not isinstance(intent, dict):
+        raise ValueError(f"{label}.intent 不是 object")
+    intent_hash = blockchain_sync.hash_intent(intent)
+    filled_data = blockchain_sync._call_data(  # noqa: SLF001 - 低階 ABI helper 集中在 blockchain_sync。
+        blockchain_sync.ROUTER_FILLED_AMOUNT_IN_SELECTOR,
+        [blockchain_sync._encode_bytes32(intent_hash)],  # noqa: SLF001
+    )
+    filled_amount = int(
+        blockchain_sync._decode_uint256(  # noqa: SLF001
+            blockchain_sync._eth_call(str(config["routerAddress"]), filled_data, config["rpcUrl"])  # noqa: SLF001
+        )
+        or "0"
+    )
+    required_amount = int(str(execute_amount_in))
+    amount_in = int(str(intent["amountIn"]))
+    return {
+        "label": label,
+        "intentHash": intent_hash,
+        "user": intent["user"],
+        "tokenIn": intent["tokenIn"],
+        "executeAmountIn": str(required_amount),
+        "amountIn": str(amount_in),
+        "filledAmountIn": str(filled_amount),
+        "remainingAmountIn": str(max(amount_in - filled_amount, 0)),
+        "requiredFilledAmountIn": str(required_amount),
+        "hasFilledRequiredAmount": filled_amount >= required_amount,
+    }
+
+
+def _check_treasury_capacity(payload: dict[str, Any], config: dict[str, str | None]) -> dict[str, Any]:
+    """
+    檢查 actionType=2 時 treasury 是否有足夠 tokenOut。
+
+    輸入：
+    - `payload`：嚴格 execution payload。
+    - `config`：RPC / Treasury 設定。
+
+    輸出：
+    - 回傳 treasury tokenOut 餘額檢查結果。
+    """
+    treasury_address = config.get("treasuryAddress")
+    rpc_url = config.get("rpcUrl")
+    intent = (payload.get("intentA") or {}).get("intent") or {}
+    token_out = intent.get("tokenOut")
+    treasury_amount_out = (payload.get("routeDetails") or {}).get("treasuryAmountOut")
+    if not treasury_address:
+        raise ValueError("actionType=2 鏈上預檢缺少 PROTOCOL_TREASURY_ADDRESS")
+    if not token_out:
+        raise ValueError("actionType=2 鏈上預檢缺少 intentA.intent.tokenOut")
+    if treasury_amount_out in (None, ""):
+        raise ValueError("actionType=2 鏈上預檢缺少 routeDetails.treasuryAmountOut")
+
+    data = blockchain_sync._call_data(  # noqa: SLF001 - 後端低階 ABI helper 目前集中在 blockchain_sync。
+        blockchain_sync.BALANCE_OF_SELECTOR,
+        [blockchain_sync._encode_address(str(treasury_address))],  # noqa: SLF001
+    )
+    balance = int(blockchain_sync._decode_uint256(blockchain_sync._eth_call(str(token_out), data, rpc_url)) or "0")  # noqa: SLF001
+    required = int(str(treasury_amount_out))
+    return {
+        "label": "routeDetails.treasuryAmountOut",
+        "treasuryAddress": treasury_address,
+        "tokenOut": token_out,
+        "treasuryBalance": str(balance),
+        "treasuryAmountOut": str(required),
+        "hasEnoughTreasuryBalance": balance >= required,
+        "isExecutable": balance >= required,
+    }
+
+
+def _format_onchain_preflight_failure(failed_checks: list[dict[str, Any]]) -> str:
+    """
+    將鏈上預檢失敗結果整理成 operation_note / error 可讀文字。
+
+    輸入：
+    - `failed_checks`：`isExecutable = false` 的檢查項目。
+
+    輸出：
+    - 繁體中文失敗原因。
+    """
+    reasons: list[str] = []
+    for check in failed_checks:
+        label = check.get("label", "unknown")
+        if check.get("hasEnoughVaultBalance") is False:
+            reasons.append(
+                f"{label} vaultBalance={check.get('vaultBalance')} < executeAmountIn={check.get('executeAmountIn')}"
+            )
+        if check.get("hasEnoughRemainingAmount") is False:
+            reasons.append(
+                f"{label} remainingAmountIn={check.get('remainingAmountIn')} < executeAmountIn={check.get('executeAmountIn')}"
+            )
+        if check.get("hasEnoughTreasuryBalance") is False:
+            reasons.append(
+                f"{label} treasuryBalance={check.get('treasuryBalance')} < treasuryAmountOut={check.get('treasuryAmountOut')}"
+            )
+    return "；".join(reasons) or "鏈上預檢未通過"
+
+
+def _format_onchain_confirmation_failure(failed_checks: list[dict[str, Any]]) -> str:
+    """
+    將鏈上確認失敗結果整理成可讀原因。
+
+    輸入：
+    - `failed_checks`：`hasFilledRequiredAmount = false` 的檢查項目。
+
+    輸出：
+    - 繁體中文失敗原因。
+    """
+    reasons: list[str] = []
+    for check in failed_checks:
+        label = check.get("label", "unknown")
+        reasons.append(
+            f"{label} filledAmountIn={check.get('filledAmountIn')} < required={check.get('requiredFilledAmountIn')}"
+        )
+    return "；".join(reasons) or "鏈上確認未通過"
+
+
+def _build_onchain_confirmation_result(
+    execution_id: str,
+    tx_hash: str | None = None,
+    raw_keeperhub_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    將鏈上讀取結果轉成 `submit_execution_result()` 可接受的 confirmed / failed dict。
+
+    輸入：
+    - `execution_id`：本地 execution id。
+    - `tx_hash`：可選交易 hash。
+    - `raw_keeperhub_result`：可選 KeeperHub 原始成功回覆。
+
+    輸出：
+    - confirmed：鏈上 `filledAmountIn` 足夠，可正式套用本地訂單。
+    - failed：鏈上尚無足夠證據或讀取錯誤；呼叫端可選擇不套用。
+    """
+    request = get_execution_request(execution_id)
+    evidence = check_execution_payload_onchain_confirmation(request["payload"])
+    if evidence["status"] != "confirmed":
+        return {
+            "status": "failed",
+            "failure_reason": evidence.get("failureReason") or "onchain confirmation failed",
+            "onchainEvidence": evidence,
+            "raw_keeperhub_result": raw_keeperhub_result,
+        }
+
+    result: dict[str, Any] = {
+        "status": "confirmed",
+        "tx_hash": tx_hash,
+        "onchainEvidence": evidence,
+        "raw_keeperhub_result": raw_keeperhub_result,
+        "notes": "KeeperHub success confirmed by SettlementRouter.filledAmountIn",
+    }
+    return result
+
+
+def _resolve_keeperhub_final_result(execution_id: str, normalized_result: dict[str, Any]) -> dict[str, Any]:
+    """
+    將 KeeperHub 最終結果補上鏈上確認 fallback。
+
+    輸入：
+    - `execution_id`：本地 execution id。
+    - `normalized_result`：`_extract_keeperhub_execution_result()` 的結果。
+
+    輸出：
+    - 若 KeeperHub success 沒 tx hash，但鏈上 filled amount 已達標，改回 confirmed。
+    - 若 KeeperHub workflow 後段 error，但鏈上 filled amount 已達標，仍以鏈上 confirmed 為準。
+    - 若鏈上無法確認，保留原本 failed 結果，避免把 workflow success/error 誤當鏈上成功。
+    """
+    if normalized_result.get("status") != "failed":
+        return normalized_result
+    confirmation_result = _build_onchain_confirmation_result(
+        execution_id,
+        raw_keeperhub_result=normalized_result.get("raw_receipt") or normalized_result.get("rawReceipt") or normalized_result,
+    )
+    if confirmation_result["status"] == "confirmed":
+        return confirmation_result
+    return normalized_result
+
+
 def _fetch_execution_row(execution_id: str) -> sqlite3.Row | None:
     """
     讀取 execution row。
@@ -761,14 +1395,50 @@ def _normalize_execution_result(result: dict[str, Any]) -> dict[str, Any]:
             "rawResult": result,
         }
 
+    tx_hash = _extract_tx_hash(result)
+    onchain_evidence = result.get("onchainEvidence") or result.get("onchain_evidence")
+    has_confirming_evidence = isinstance(onchain_evidence, dict) and onchain_evidence.get("confirmed") is True
+    if not tx_hash and not has_confirming_evidence:
+        return {
+            "status": "failed",
+            "failureReason": "chain execution success missing tx hash",
+            "rawResult": result,
+        }
+
     return {
         "status": "confirmed",
-        "txHash": result.get("txHash") or result.get("tx_hash"),
+        "txHash": tx_hash,
         "blockNumber": result.get("blockNumber") or result.get("block_number"),
         "rawReceipt": result.get("rawReceipt") or result.get("raw_receipt"),
+        "onchainEvidence": onchain_evidence,
         "notes": result.get("notes") or "blockchain executor confirmed execution",
         "rawResult": result,
     }
+
+
+def _extract_tx_hash(result: dict[str, Any]) -> Any:
+    """
+    從 execution 回報中取出鏈上交易 hash。
+
+    輸入：
+    - `result`：executor / KeeperHub 正規化前回報。
+
+    輸出：
+    - 找到時回傳 tx hash；找不到時回傳 `None`。
+
+    用途：
+    - 避免只因 KeeperHub workflow success 就把 execution 當成鏈上 confirmed。
+    """
+    direct = result.get("txHash") or result.get("tx_hash") or result.get("transactionHash")
+    if direct:
+        return direct
+    for receipt_key in ("rawReceipt", "raw_receipt", "receipt"):
+        receipt = result.get(receipt_key)
+        if isinstance(receipt, dict):
+            nested = receipt.get("txHash") or receipt.get("tx_hash") or receipt.get("transactionHash")
+            if nested:
+                return nested
+    return None
 
 
 def _resolve_keeperhub_webhook_url(webhook_url: str | None = None) -> str:
@@ -938,9 +1608,16 @@ def _extract_keeperhub_execution_result(body: Any) -> dict[str, Any] | None:
         if status in ("confirmed", "failed"):
             return candidate
         if status in KEEPERHUB_SUCCESS_STATUSES:
+            tx_hash = _extract_tx_hash(candidate)
+            if not tx_hash:
+                return {
+                    "status": "failed",
+                    "failure_reason": "KeeperHub workflow succeeded without chain tx hash",
+                    "raw_receipt": candidate,
+                }
             return {
                 "status": "confirmed",
-                "tx_hash": candidate.get("txHash") or candidate.get("tx_hash"),
+                "tx_hash": tx_hash,
                 "block_number": candidate.get("blockNumber") or candidate.get("block_number"),
                 "raw_receipt": candidate,
                 "notes": "KeeperHub execution succeeded",

@@ -25,5 +25,5 @@ export function useAuth() {
     }
   }, [isConnected, address, token]);
 
-  return { token, loading, error, isAuthenticated: !!token };
+  return { address, token, loading, error, isAuthenticated: !!token };
 }

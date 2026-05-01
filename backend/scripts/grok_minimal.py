@@ -85,7 +85,11 @@ def load_agent_memory(memory_dir: Path = MEMORY_DIR) -> str:
     if not memory_dir.exists():
         return ""
 
-    memory_files = sorted(memory_dir.glob("*.md"))
+    memory_files = sorted(
+        memory_file
+        for memory_file in memory_dir.glob("*.md")
+        if not memory_file.name.startswith("._")
+    )
     main_memory = memory_dir / "mainagent.md"
     if main_memory in memory_files:
         memory_files.remove(main_memory)
@@ -93,7 +97,7 @@ def load_agent_memory(memory_dir: Path = MEMORY_DIR) -> str:
 
     sections: list[str] = []
     for memory_file in memory_files:
-        content = memory_file.read_text(encoding="utf-8").strip()
+        content = memory_file.read_text(encoding="utf-8", errors="replace").strip()
         if not content:
             continue
         sections.append(f"## 記憶檔案：{memory_file.name}\n\n{content}")

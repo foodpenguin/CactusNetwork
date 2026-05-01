@@ -42,6 +42,64 @@ def test_call_data_encodes_filled_amount_in_bytes32() -> None:
     assert data == "0xec980a9c" + "12" * 32
 
 
+def test_hash_intent_returns_bytes32_hash() -> None:
+    """測試 UserIntent hash 可供查 SettlementRouter.filledAmountIn 使用。"""
+    intent = {
+        "user": "0x1111111111111111111111111111111111111111",
+        "tokenIn": "0x2222222222222222222222222222222222222222",
+        "tokenOut": "0x3333333333333333333333333333333333333333",
+        "amountIn": "10",
+        "minAmountOut": "20",
+        "deadline": 1999999999,
+        "salt": "0x" + "ab" * 32,
+        "allowPartialFill": True,
+    }
+
+    intent_hash = blockchain_sync.hash_intent(intent)
+
+    assert intent_hash.startswith("0x")
+    assert len(intent_hash) == 66
+    assert intent_hash == blockchain_sync.hash_intent(intent)
+
+
+def test_read_intent_execution_capacity_reads_vault_and_filled_amount(monkeypatch: pytest.MonkeyPatch) -> None:
+    """測試可讀 vaultBalance / filledAmountIn 並判斷本次 executeAmountIn 是否可執行。"""
+    intent = {
+        "user": "0x1111111111111111111111111111111111111111",
+        "tokenIn": "0x2222222222222222222222222222222222222222",
+        "tokenOut": "0x3333333333333333333333333333333333333333",
+        "amountIn": "10",
+        "minAmountOut": "20",
+        "deadline": 1999999999,
+        "salt": "0x" + "ab" * 32,
+        "allowPartialFill": True,
+    }
+
+    def fake_eth_call(contract_address, data, rpc_url=None):
+        if data.startswith(blockchain_sync.VAULT_BALANCES_SELECTOR):
+            return "0x" + hex(9)[2:].rjust(64, "0")
+        if data.startswith(blockchain_sync.ROUTER_FILLED_AMOUNT_IN_SELECTOR):
+            return "0x" + hex(2)[2:].rjust(64, "0")
+        raise AssertionError(f"unexpected call: {contract_address} {data}")
+
+    monkeypatch.setattr(blockchain_sync, "_eth_call", fake_eth_call)
+
+    result = blockchain_sync.read_intent_execution_capacity(
+        intent,
+        "8",
+        rpc_url="http://mock-rpc",
+        vault_address="0x4444444444444444444444444444444444444444",
+        router_address="0x5555555555555555555555555555555555555555",
+    )
+
+    assert result["vaultBalance"] == "9"
+    assert result["filledAmountIn"] == "2"
+    assert result["remainingAmountIn"] == "8"
+    assert result["hasEnoughVaultBalance"] is True
+    assert result["hasEnoughRemainingAmount"] is True
+    assert result["isExecutable"] is True
+
+
 def test_build_v3_exact_input_single_calldata() -> None:
     """測試後端可自行組 Uniswap V3 exactInputSingle calldata。"""
     calldata = blockchain_sync._build_v3_exact_input_single_calldata(

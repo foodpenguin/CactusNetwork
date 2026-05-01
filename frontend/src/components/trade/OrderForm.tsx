@@ -5,6 +5,8 @@ import { useBuyOrder, useSellOrder } from '@/hooks/useOrders';
 import { useAuth } from '@/hooks/useAuth';
 import { SlippageWarning } from './SlippageWarning';
 import { useLanguage } from '@/contexts/LanguageContext';
+import { useWalletClient } from 'wagmi';
+import { buildSignedIntent } from '@/lib/intent';
 
 interface Props {
   onOrderSubmitted: (slippage: number, splits: number, chunkSize: number) => void;
@@ -22,8 +24,9 @@ function estimateSlippage(amount: number): number {
 }
 
 export function OrderForm({ onOrderSubmitted }: Props) {
-  const { isAuthenticated } = useAuth();
+  const { address, isAuthenticated } = useAuth();
   const { t } = useLanguage();
+  const { data: walletClient } = useWalletClient();
   const [tab, setTab] = useState<'buy' | 'sell'>('sell');
   const [asset] = useState('WETH');
   const [amount, setAmount] = useState('');
@@ -32,6 +35,7 @@ export function OrderForm({ onOrderSubmitted }: Props) {
   const [maxFee, setMaxFee] = useState('0.3');
   const [slippage, setSlippage] = useState(0);
   const [estimated, setEstimated] = useState(false);
+  const [submitError, setSubmitError] = useState('');
 
   const buyMutation = useBuyOrder();
   const sellMutation = useSellOrder();
@@ -60,6 +64,15 @@ export function OrderForm({ onOrderSubmitted }: Props) {
     const chunkSize = Math.ceil(amt / splits);
 
     try {
+      setSubmitError('');
+      if (!address) return;
+      const signedIntent = await buildSignedIntent({
+        side: tab,
+        user: address,
+        walletClient,
+        amount: amt,
+        unitPriceUsdc: price,
+      });
       if (tab === 'sell') {
         await sellMutation.mutateAsync({
           asset,
@@ -67,6 +80,7 @@ export function OrderForm({ onOrderSubmitted }: Props) {
           min_unit_price_usdc: price,
           max_splits: splits,
           max_fee_percent: fee,
+          ...signedIntent,
         });
       } else {
         await buyMutation.mutateAsync({
@@ -75,15 +89,16 @@ export function OrderForm({ onOrderSubmitted }: Props) {
           max_unit_price_usdc: price,
           max_splits: splits,
           max_fee_percent: fee,
+          ...signedIntent,
         });
       }
       onOrderSubmitted(sl, splits, chunkSize);
-    } catch {
-      // error displayed below
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : '送出訂單失敗');
     }
   }
 
-  const error = buyMutation.error?.message || sellMutation.error?.message;
+  const error = submitError || buyMutation.error?.message || sellMutation.error?.message;
 
   return (
     <div
