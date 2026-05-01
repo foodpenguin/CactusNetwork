@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from scripts import api_server
 from scripts import blockchain_sync
 from scripts import internal_api
+from scripts import matching_service
 from scripts import orchestrator_server
 from scripts.internal_api import app
 
@@ -151,6 +152,39 @@ def test_internal_api_rejects_missing_token() -> None:
     assert response.status_code == 401
 
 
+def test_internal_api_defaults_to_grok_drain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """測試 internal matching API 預設使用 Grok 並 drain 到沒有可派發賣單。"""
+    captured: dict[str, object] = {}
+
+    def fake_run_matching_drain(agent: str, candidate_limit: int, max_cycles: int):
+        captured.update(
+            {
+                "agent": agent,
+                "candidate_limit": candidate_limit,
+                "max_cycles": max_cycles,
+            }
+        )
+        return {
+            "status": "matching_drain_completed",
+            "agent": agent,
+            "stopReason": "no_processable_sell_order",
+            "cyclesRun": 0,
+            "cycles": [],
+        }
+
+    monkeypatch.setattr(matching_service, "run_matching_drain", fake_run_matching_drain)
+
+    response = client.post("/internal/matching/run", headers=auth_headers(), json={})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "matching_drain_completed"
+    assert captured == {
+        "agent": "grok",
+        "candidate_limit": 5,
+        "max_cycles": 100,
+    }
+
+
 def test_internal_api_full_backend_to_chain_message_flow() -> None:
     """測試 internal API 可跑媒合、取 payload、dispatch、回報 confirmed。"""
     buy_id = insert_buy_order()
@@ -159,7 +193,7 @@ def test_internal_api_full_backend_to_chain_message_flow() -> None:
     match_response = client.post(
         "/internal/matching/run",
         headers=auth_headers(),
-        json={"agent": "main-brain", "candidate_limit": 5},
+        json={"agent": "main-brain", "candidate_limit": 5, "drain_until_empty": False},
     )
     pending_response = client.get(
         "/internal/executions/pending",
@@ -210,7 +244,7 @@ def test_internal_api_failed_result_does_not_update_orders() -> None:
     client.post(
         "/internal/matching/run",
         headers=auth_headers(),
-        json={"agent": "main-brain", "candidate_limit": 5},
+        json={"agent": "main-brain", "candidate_limit": 5, "drain_until_empty": False},
     )
     execution_id = client.get(
         "/internal/executions/pending",

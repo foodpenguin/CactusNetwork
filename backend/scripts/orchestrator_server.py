@@ -689,12 +689,15 @@ def _select_next_sell_order(excluded_ids: set[int]) -> sqlite3.Row | None:
     副作用：
     - 若選到非 admin 賣單，會推進 `weighted_index`。
     """
+    locked_sell_ids = _open_execution_sell_order_ids()
+    effective_excluded_ids = set(excluded_ids) | locked_sell_ids
+
     excluded_sql = ""
     params: list[Any] = []
-    if excluded_ids:
-        placeholders = ",".join("?" for _ in excluded_ids)
+    if effective_excluded_ids:
+        placeholders = ",".join("?" for _ in effective_excluded_ids)
         excluded_sql = f"AND id NOT IN ({placeholders})"
-        params.extend(sorted(excluded_ids))
+        params.extend(sorted(effective_excluded_ids))
 
     with sqlite3.connect(SELL_ORDERS_DB) as conn:
         conn.row_factory = sqlite3.Row
@@ -735,6 +738,66 @@ def _select_next_sell_order(excluded_ids: set[int]) -> sqlite3.Row | None:
                     return row
 
     return None
+
+
+def _open_execution_sell_order_ids() -> set[int]:
+    """
+    找出已有待執行 execution 的賣單。
+
+    輸入：
+    - 無；固定讀取 `executions.db`。
+
+    輸出：
+    - 回傳 status 為 `proposed` 或 `dispatched` 的 `sell_order_id` set。
+
+    用途：
+    - drain queue 時避免同一張賣單在鏈上 confirmed/failed 前被重複派給主腦。
+    """
+    _ensure_databases()
+    with sqlite3.connect(EXECUTIONS_DB) as conn:
+        rows = conn.execute(
+            """
+            SELECT sell_order_id
+            FROM executions
+            WHERE status IN ('proposed', 'dispatched')
+            """
+        ).fetchall()
+    return {int(row[0]) for row in rows if row[0] is not None}
+
+
+def _open_execution_buy_order_ids() -> set[int]:
+    """
+    找出已被待執行 execution 鎖定的買單。
+
+    輸入：
+    - 無；固定讀取 `executions.db` 的 `proposal_json`。
+
+    輸出：
+    - 回傳 status 為 `proposed` 或 `dispatched` 且出現在 `matches[].buyOrderId` 的買單 id set。
+
+    用途：
+    - drain queue 時避免同一筆買單在鏈上 confirmed/failed 前被多張賣單重複使用。
+    """
+    _ensure_databases()
+    locked_ids: set[int] = set()
+    with sqlite3.connect(EXECUTIONS_DB) as conn:
+        rows = conn.execute(
+            """
+            SELECT proposal_json
+            FROM executions
+            WHERE status IN ('proposed', 'dispatched')
+            """
+        ).fetchall()
+    for row in rows:
+        try:
+            proposal = json.loads(row[0])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        for match in proposal.get("matches") or []:
+            buy_order_id = match.get("buyOrderId")
+            if buy_order_id is not None:
+                locked_ids.add(int(buy_order_id))
+    return locked_ids
 
 
 def _find_candidate_buy_order(sell_order: sqlite3.Row) -> sqlite3.Row | None:
@@ -788,20 +851,30 @@ def _find_candidate_buy_orders(sell_order: sqlite3.Row, limit: int) -> list[sqli
     - 無；此函式只讀取 `buy_orders.db`。
     """
     safe_limit = max(1, int(limit))
+    locked_buy_ids = _open_execution_buy_order_ids()
+    locked_sql = ""
+    params: list[Any] = [sell_order["asset"], sell_order["min_unit_price_usdc"]]
+    if locked_buy_ids:
+        placeholders = ",".join("?" for _ in locked_buy_ids)
+        locked_sql = f"AND id NOT IN ({placeholders})"
+        params.extend(sorted(locked_buy_ids))
+    params.append(safe_limit)
+
     with sqlite3.connect(BUY_ORDERS_DB) as conn:
         conn.row_factory = sqlite3.Row
         return conn.execute(
-            """
+            f"""
             SELECT *
             FROM buy_orders
             WHERE status = 'pending'
               AND remaining_amount > 0
               AND asset = ?
               AND max_unit_price_usdc >= ?
+              {locked_sql}
             ORDER BY max_unit_price_usdc DESC, created_at ASC, id ASC
             LIMIT ?
             """,
-            (sell_order["asset"], sell_order["min_unit_price_usdc"], safe_limit),
+            params,
         ).fetchall()
 
 

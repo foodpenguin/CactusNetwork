@@ -339,6 +339,33 @@ def test_proposed_execution_records_execution_without_changing_orders() -> None:
     assert execution[1] == "proposed"
 
 
+def test_prepare_agent_task_skips_sell_order_with_open_execution() -> None:
+    """測試已有 proposed execution 的賣單不會被重複派給主腦。"""
+    buy_id = insert_buy_order(account_name="buyer_a", amount=10, max_price=3000)
+    sell_id = insert_sell_order(account_name="seller_a", amount=1, min_price=2900)
+
+    task = orchestrator_server.prepare_agent_task(candidate_limit=3)["task"]
+    orchestrator_server.apply_agent_decision(
+        {
+            "taskId": task["taskId"],
+            "decisionStatus": "proposed_execution",
+            "sellOrderId": sell_id,
+            "matches": [
+                {
+                    "buyOrderId": buy_id,
+                    "filledAmount": 1,
+                    "unitPriceUsdc": 2950,
+                }
+            ],
+        }
+    )
+
+    next_task = orchestrator_server.prepare_agent_task(candidate_limit=3)
+
+    assert next_task["status"] == "no_pending_sell_order"
+    assert next_task["task"] is None
+
+
 def test_external_dex_proposed_execution_can_be_recorded_without_buy_matches() -> None:
     """測試外部 DEX actionType=0 成交提案不需要本地買單 matches。"""
     sell_id = insert_sell_order(account_name="seller_a", amount=100000000, min_price=0)

@@ -24,10 +24,14 @@ class RunMatchingRequest(BaseModel):
     輸入：
     - `agent`：主腦來源。
     - `candidate_limit`：本輪最多提供幾筆候選買單。
+    - `drain_until_empty`：是否持續處理到沒有可派發賣單。
+    - `max_cycles`：drain 的安全上限。
     """
 
-    agent: Literal["main-brain", "grok", "simulated"] = "main-brain"
+    agent: Literal["main-brain", "grok", "simulated"] = "grok"
     candidate_limit: int = Field(default=5, ge=1)
+    drain_until_empty: bool = True
+    max_cycles: int = Field(default=100, ge=1)
 
 
 class DispatchExecutionRequest(BaseModel):
@@ -62,19 +66,26 @@ app = FastAPI(
 )
 
 
-@app.post("/internal/matching/run", summary="觸發一次後端媒合")
+@app.post("/internal/matching/run", summary="觸發後端媒合")
 def run_matching(payload: RunMatchingRequest, x_internal_token: str = Header(default="")) -> dict[str, Any]:
     """
-    觸發一次後端媒合。
+    觸發後端媒合。
 
     輸入：
     - Header：`X-Internal-Token`。
     - JSON body：`RunMatchingRequest`。
 
     輸出：
-    - 回傳 timeout refresh 與 runner 結果。
+    - 預設回傳 drain 結果，持續處理到沒有可派發賣單。
+    - 若 `drain_until_empty=false`，只跑一輪媒合。
     """
     _require_internal_token(x_internal_token)
+    if payload.drain_until_empty:
+        return matching_service.run_matching_drain(
+            agent=payload.agent,
+            candidate_limit=payload.candidate_limit,
+            max_cycles=payload.max_cycles,
+        )
     return matching_service.run_matching_once(
         agent=payload.agent,
         candidate_limit=payload.candidate_limit,

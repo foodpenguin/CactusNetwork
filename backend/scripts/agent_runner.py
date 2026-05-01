@@ -428,7 +428,7 @@ def run_cli() -> None:
     """
     parser = argparse.ArgumentParser(description="CactusNetwork agents runner")
     parser.add_argument("--candidate-limit", type=int, default=5)
-    parser.add_argument("--agent", choices=["simulated", "main-brain", "grok"], default="simulated")
+    parser.add_argument("--agent", choices=["simulated", "main-brain", "grok"], default="grok")
     args = parser.parse_args()
 
     if args.agent == "grok":

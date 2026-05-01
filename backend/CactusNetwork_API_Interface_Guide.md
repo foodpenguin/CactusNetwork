@@ -287,7 +287,7 @@ incomplete_missing_frontend_wallet_fields
 
 這些不是一般前端要碰的，是給後端中控與區塊鏈端串接用。
 
-## 5. 觸發一次媒合
+## 5. 觸發後端媒合
 
 ```text
 POST /internal/matching/run
@@ -303,47 +303,77 @@ X-Internal-Token: <INTERNAL_API_TOKEN>
 
 ```json
 {
-  "agent": "main-brain",
-  "candidate_limit": 5
+  "agent": "grok",
+  "candidate_limit": 5,
+  "drain_until_empty": true,
+  "max_cycles": 100
 }
 ```
 
 `agent` 可用：
 
 ```text
-main-brain
 grok
+main-brain
 simulated
+```
+
+預設值：
+
+```text
+agent = grok
+candidate_limit = 5
+drain_until_empty = true
+max_cycles = 100
+```
+
+如果只想跑一筆賣單，傳：
+
+```json
+{
+  "drain_until_empty": false
+}
 ```
 
 ### 傳出
 
 ```json
 {
-  "timeoutRefresh": {
-    "timedOutCount": 0
-  },
-  "runnerResult": {
-    "status": "execution_proposed",
-    "applyResult": {
-      "executionId": "exec_20260501_000001",
-      "executionStatus": "proposed"
+  "status": "matching_drain_completed",
+  "agent": "grok",
+  "stopReason": "no_processable_sell_order",
+  "cyclesRun": 2,
+  "cycles": [
+    {
+      "status": "matching_cycle_completed",
+      "runnerResult": {
+        "status": "execution_proposed",
+        "applyResult": {
+          "executionId": "exec_20260501_000001",
+          "executionStatus": "proposed"
+        }
+      }
     }
-  }
+  ]
 }
 ```
 
 ### 意思
 
-這支 API 會讓後端跑一次：
+這支 API 預設會讓後端持續處理賣單，直到沒有可派發的 pending 賣單：
 
 ```text
-讀取訂單
-交給主腦判斷
+刷新 timeout
+讀取下一筆可派發賣單
+交給 Grok 主腦判斷
 如果可成交，產生嚴格區塊鏈 payload
+繼續處理下一筆賣單
+直到沒有可派發賣單
 ```
 
 系統不會在這一步直接上鏈。
+
+若某筆賣單已經產生 `proposed` 或 `dispatched` execution，系統會等區塊鏈端回覆 confirmed / failed，不會重複派發同一筆賣單。
 
 ## 6. 取得待送出的交易請求
 

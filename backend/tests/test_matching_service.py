@@ -38,7 +38,7 @@ def isolated_matching_service_databases(tmp_path: Path, monkeypatch: pytest.Monk
     blockchain_sync._init_external_contracts_database()
 
 
-def insert_buy_order() -> int:
+def insert_buy_order(account_name: str = "buyer") -> int:
     """插入買單測試資料。"""
     now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(orchestrator_server.BUY_ORDERS_DB) as conn:
@@ -60,13 +60,13 @@ def insert_buy_order() -> int:
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            ("buyer", "free", "WETH", 2, 2, 3000, 3, 0.3, "pending", 0, now, now),
+            (account_name, "free", "WETH", 2, 2, 3000, 3, 0.3, "pending", 0, now, now),
         )
         conn.commit()
         return int(cursor.lastrowid)
 
 
-def insert_sell_order() -> int:
+def insert_sell_order(account_name: str = "seller") -> int:
     """插入賣單測試資料。"""
     now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(orchestrator_server.SELL_ORDERS_DB) as conn:
@@ -89,7 +89,7 @@ def insert_sell_order() -> int:
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            ("seller", "free", "WETH", 1, 1, 2900, 3, 0.3, "pending", 0, now, now, now),
+            (account_name, "free", "WETH", 1, 1, 2900, 3, 0.3, "pending", 0, now, now, now),
         )
         conn.commit()
         return int(cursor.lastrowid)
@@ -118,3 +118,54 @@ def test_run_matching_once_reports_no_task_when_queue_is_empty() -> None:
 
     assert result["status"] == "matching_cycle_completed"
     assert result["runnerResult"]["status"] == "no_task"
+
+
+def test_run_matching_defaults_to_grok(monkeypatch: pytest.MonkeyPatch) -> None:
+    """測試正式媒合預設使用 Grok 主腦。"""
+    selected_agents: list[str] = []
+
+    def fake_select_agent(agent: str):
+        selected_agents.append(agent)
+
+        def fake_agent(task, external_context):
+            return {
+                "taskId": task["taskId"],
+                "decisionStatus": "invalid",
+                "sellOrderId": task["sellOrder"]["id"],
+                "failureReason": "測試預設 agent，不呼叫真實 Grok",
+            }
+
+        return fake_agent
+
+    insert_sell_order()
+    monkeypatch.setattr(matching_service, "_select_agent_decide", fake_select_agent)
+
+    result = matching_service.run_matching_once()
+
+    assert selected_agents == ["grok"]
+    assert result["agent"] == "grok"
+
+
+def test_run_matching_drain_processes_until_no_processable_sell_order() -> None:
+    """測試 drain 會連續處理賣單，直到剩下的賣單都在等待 execution 回覆。"""
+    insert_buy_order("buyer-1")
+    insert_buy_order("buyer-2")
+    insert_sell_order("seller-1")
+    insert_sell_order("seller-2")
+
+    result = matching_service.run_matching_drain(agent="main-brain", candidate_limit=5, max_cycles=5)
+
+    assert result["status"] == "matching_drain_completed"
+    assert result["agent"] == "main-brain"
+    assert result["stopReason"] == "no_processable_sell_order"
+    assert result["cyclesRun"] == 3
+    assert [cycle["runnerResult"]["status"] for cycle in result["cycles"]] == [
+        "execution_proposed",
+        "execution_proposed",
+        "no_task",
+    ]
+
+    with sqlite3.connect(orchestrator_server.EXECUTIONS_DB) as conn:
+        execution_count = conn.execute("SELECT COUNT(*) FROM executions WHERE status = 'proposed'").fetchone()[0]
+
+    assert execution_count == 2

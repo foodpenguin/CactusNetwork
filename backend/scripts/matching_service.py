@@ -9,7 +9,11 @@ from scripts import agent_runner
 from scripts import orchestrator_server
 
 
-def run_matching_once(agent: str = "main-brain", candidate_limit: int = 5) -> dict[str, Any]:
+DEFAULT_AGENT = "grok"
+DEFAULT_DRAIN_MAX_CYCLES = 100
+
+
+def run_matching_once(agent: str = DEFAULT_AGENT, candidate_limit: int = 5) -> dict[str, Any]:
     """
     執行一次後端媒合流程。
 
@@ -39,7 +43,7 @@ def run_matching_once(agent: str = "main-brain", candidate_limit: int = 5) -> di
 
 
 def run_matching_loop(
-    agent: str = "main-brain",
+    agent: str = DEFAULT_AGENT,
     candidate_limit: int = 5,
     interval_seconds: int = 15 * 60,
     max_cycles: int | None = None,
@@ -57,17 +61,61 @@ def run_matching_loop(
     - 回傳已執行輪次的結果 list。若 `max_cycles=None`，通常不會自然回傳。
 
     副作用：
-    - 週期性呼叫 `run_matching_once()`。
+    - 週期性呼叫 `run_matching_drain()`，每輪會處理到沒有可派發賣單。
     """
     results: list[dict[str, Any]] = []
     cycle = 0
     while max_cycles is None or cycle < max_cycles:
-        results.append(run_matching_once(agent=agent, candidate_limit=candidate_limit))
+        results.append(run_matching_drain(agent=agent, candidate_limit=candidate_limit))
         cycle += 1
         if max_cycles is not None and cycle >= max_cycles:
             break
         time.sleep(max(1, int(interval_seconds)))
     return results
+
+
+def run_matching_drain(
+    agent: str = DEFAULT_AGENT,
+    candidate_limit: int = 5,
+    max_cycles: int = DEFAULT_DRAIN_MAX_CYCLES,
+) -> dict[str, Any]:
+    """
+    持續執行媒合，直到沒有可派發的 pending 賣單。
+
+    輸入：
+    - `agent`：使用哪個主腦來源，正式預設為 `grok`。
+    - `candidate_limit`：每輪最多提供幾筆候選買單。
+    - `max_cycles`：安全上限，避免資料異常導致無限循環。
+
+    輸出：
+    - 回傳本次 drain 的所有 cycle 結果與停止原因。
+
+    副作用：
+    - 每個 cycle 都會呼叫 `run_matching_once()`。
+    - 已有 `proposed/dispatched` execution 的賣單會被視為等待鏈上結果，不會重複派發。
+    """
+    safe_max_cycles = max(1, int(max_cycles))
+    cycles: list[dict[str, Any]] = []
+    stop_reason = "max_cycles_reached"
+
+    for _ in range(safe_max_cycles):
+        result = run_matching_once(agent=agent, candidate_limit=candidate_limit)
+        cycles.append(result)
+        runner_status = result.get("runnerResult", {}).get("status")
+        if runner_status == "no_task":
+            stop_reason = "no_processable_sell_order"
+            break
+        if runner_status == "waiting_for_final_agent_decision":
+            stop_reason = "waiting_for_final_agent_decision"
+            break
+
+    return {
+        "status": "matching_drain_completed",
+        "agent": agent,
+        "stopReason": stop_reason,
+        "cyclesRun": len(cycles),
+        "cycles": cycles,
+    }
 
 
 def run_cli() -> None:
@@ -76,7 +124,8 @@ def run_cli() -> None:
 
     輸入：
     - `once`：跑一輪媒合。
-    - `loop`：持續跑媒合。
+    - `drain`：持續跑到沒有可派發賣單。
+    - `loop`：每隔一段時間執行一次 drain。
 
     輸出：
     - 將結果以 JSON 印到 stdout。
@@ -85,11 +134,16 @@ def run_cli() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     once_parser = subparsers.add_parser("once")
-    once_parser.add_argument("--agent", choices=["main-brain", "grok", "simulated"], default="main-brain")
+    once_parser.add_argument("--agent", choices=["main-brain", "grok", "simulated"], default=DEFAULT_AGENT)
     once_parser.add_argument("--candidate-limit", type=int, default=5)
 
+    drain_parser = subparsers.add_parser("drain")
+    drain_parser.add_argument("--agent", choices=["main-brain", "grok", "simulated"], default=DEFAULT_AGENT)
+    drain_parser.add_argument("--candidate-limit", type=int, default=5)
+    drain_parser.add_argument("--max-cycles", type=int, default=DEFAULT_DRAIN_MAX_CYCLES)
+
     loop_parser = subparsers.add_parser("loop")
-    loop_parser.add_argument("--agent", choices=["main-brain", "grok", "simulated"], default="main-brain")
+    loop_parser.add_argument("--agent", choices=["main-brain", "grok", "simulated"], default=DEFAULT_AGENT)
     loop_parser.add_argument("--candidate-limit", type=int, default=5)
     loop_parser.add_argument("--interval-seconds", type=int, default=15 * 60)
     loop_parser.add_argument("--max-cycles", type=int)
@@ -97,6 +151,12 @@ def run_cli() -> None:
     args = parser.parse_args()
     if args.command == "once":
         result = run_matching_once(agent=args.agent, candidate_limit=args.candidate_limit)
+    elif args.command == "drain":
+        result = run_matching_drain(
+            agent=args.agent,
+            candidate_limit=args.candidate_limit,
+            max_cycles=args.max_cycles,
+        )
     elif args.command == "loop":
         result = run_matching_loop(
             agent=args.agent,
