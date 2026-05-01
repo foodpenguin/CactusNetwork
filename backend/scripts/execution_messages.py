@@ -520,7 +520,11 @@ def _keeperhub_headers(extra_headers: dict[str, str]) -> dict[str, str]:
     - `KEEPERHUB_WEBHOOK_TOKEN`：Bearer token，會自動組成 `Authorization: Bearer ...`。
     """
     _load_env()
-    headers = dict(extra_headers)
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "CactusNetwork-Backend/0.1 (+https://github.com/foodpenguin/CactusNetwork)",
+        **extra_headers,
+    }
     if "Authorization" not in headers:
         authorization = os.getenv("KEEPERHUB_WEBHOOK_AUTHORIZATION")
         token = os.getenv("KEEPERHUB_WEBHOOK_TOKEN")
