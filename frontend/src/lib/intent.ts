@@ -155,6 +155,7 @@ export async function buildSignedIntent({
  */
 export async function depositToVault({
   walletClient,
+  publicClient,
   user,
   side,
   amount,
@@ -162,6 +163,7 @@ export async function depositToVault({
   useETH = true,
 }: {
   walletClient: WalletClient;
+  publicClient: any; // Use wagmi PublicClient
   user: `0x${string}`;
   side: OrderSide;
   amount: number;
@@ -175,33 +177,37 @@ export async function depositToVault({
 
   if (side === 'sell' && useETH) {
     // 直接用 ETH 存入，合約會自動 wrap 為 WETH
-    await walletClient.writeContract({
+    const hash = await walletClient.writeContract({
       address: INTENT_VAULT_ADDRESS as `0x${string}`,
       abi: INTENT_VAULT_ABI,
       functionName: 'depositETH',
       args: [],
       value: amountIn,
       account: user,
-      chain: { id: SEPOLIA_CHAIN_ID } as any,
+      chain: undefined, // Let it infer chain
     });
+    await publicClient.waitForTransactionReceipt({ hash });
   } else {
     // ERC20: approve → deposit
-    await walletClient.writeContract({
+    const approveHash = await walletClient.writeContract({
       address: tokenIn as `0x${string}`,
       abi: ERC20_ABI,
       functionName: 'approve',
       args: [INTENT_VAULT_ADDRESS as `0x${string}`, amountIn],
       account: user,
-      chain: { id: SEPOLIA_CHAIN_ID } as any,
+      chain: undefined,
     });
-    await walletClient.writeContract({
+    await publicClient.waitForTransactionReceipt({ hash: approveHash });
+
+    const depositHash = await walletClient.writeContract({
       address: INTENT_VAULT_ADDRESS as `0x${string}`,
       abi: INTENT_VAULT_ABI,
       functionName: 'deposit',
       args: [tokenIn as `0x${string}`, amountIn],
       account: user,
-      chain: { id: SEPOLIA_CHAIN_ID } as any,
+      chain: undefined,
     });
+    await publicClient.waitForTransactionReceipt({ hash: depositHash });
   }
 }
 
