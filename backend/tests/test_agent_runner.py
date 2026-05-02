@@ -168,6 +168,32 @@ def test_extract_response_text_reads_responses_output_content() -> None:
     assert grok_minimal.extract_response_text(data) == '{"ok": true}'
 
 
+def test_load_agent_memory_prioritizes_mainagent_and_combines_specialized_memory(tmp_path: Path) -> None:
+    """測試長期記憶會先讀 mainagent，再合併其他專用記憶。"""
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "orchestrator.md").write_text("中控記憶", encoding="utf-8")
+    (memory_dir / "mainagent.md").write_text("主腦記憶", encoding="utf-8")
+    (memory_dir / "output_format.md").write_text("輸出格式記憶", encoding="utf-8")
+
+    memory = grok_minimal.load_agent_memory(memory_dir)
+
+    assert memory.index("mainagent.md") < memory.index("orchestrator.md")
+    assert "主腦記憶" in memory
+    assert "中控記憶" in memory
+    assert "輸出格式記憶" in memory
+
+
+def test_build_prompt_treats_memory_as_project_operating_context() -> None:
+    """測試送給 Grok 的 system prompt 會明確要求使用長期記憶。"""
+    messages = grok_minimal.build_prompt(memory="主腦長期記憶", task="本輪任務")
+
+    assert "長期記憶是專案穩定架構" in messages[0]["content"]
+    assert "以目前任務中的明確欄位" in messages[0]["content"]
+    assert "主腦長期記憶" in messages[1]["content"]
+    assert "本輪任務" in messages[2]["content"]
+
+
 def test_grok_agent_decide_calls_grok_and_normalizes_external_request(monkeypatch: pytest.MonkeyPatch) -> None:
     """測試 Grok adapter 會呼叫 Grok，並補齊 request_external_contract_data 的必要欄位。"""
     task = make_grok_test_task()
