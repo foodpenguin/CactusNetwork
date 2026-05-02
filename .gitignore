@@ -18,6 +18,9 @@ backend/data/
 backend/archive/
 backend/CactusNetwork_Project_Plan.md
 
+# Local AI-agent context files
+frontend/FRONTEND_AI_CONTEXT.md
+
 # OS
 .DS_Store
 Thumbs.db
