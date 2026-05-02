@@ -82,7 +82,7 @@ export async function approvePriorityFee({
     functionName: 'approve',
     args: [PRIORITY_FEE_ADDRESS as `0x${string}`, rawAmount],
     account: user,
-    chain: { id: CONTRACTS.CHAIN_ID } as any,
+    chain: undefined,
   });
   return hash;
 }
@@ -106,7 +106,7 @@ export async function payPriorityFee({
     functionName: 'pay',
     args: [CONTRACTS.USDC as `0x${string}`, rawAmount],
     account: user,
-    chain: { id: CONTRACTS.CHAIN_ID } as any,
+    chain: undefined,
   });
   return hash;
 }

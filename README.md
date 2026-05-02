@@ -144,12 +144,13 @@ pnpm run dev     # starts on http://localhost:3000
 - **Chun Han Wu**: Project Assistant
   - Created project presentations and demo videos
   - Handled administrative tasks
-  - IG: @re_aprhp_027
+  - Email: ansenchen.12@gmail.com
 
 - **Yu I Lin**: Project Assistant
-  - Created project presentations and demo videos
-  - Handled administrative tasks
-  - IG: @re_aprhp_027
+  - Developed a responsive and intuitive frontend interface using Next.js/React, focusing on seamless user experience (UX).
+  - Architected the communication layer to integrate backend APIs, ensuring efficient data fetching and real-time state management.
+  - Visual Design
+  - Email: t112AB0004@ntut.org.tw
 
 ## Demo Video
 

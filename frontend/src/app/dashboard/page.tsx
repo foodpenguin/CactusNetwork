@@ -1,20 +1,52 @@
 'use client';
 
+import { useEffect, useState } from 'react';
 import { ActiveOrdersTable } from '@/components/dashboard/ActiveOrdersTable';
 import { useLanguage } from '@/contexts/LanguageContext';
 import { useBuyOrders, useSellOrders, useExecutions } from '@/hooks/useOrders';
 import { useAuth } from '@/hooks/useAuth';
 import type { AnyOrder, OrderStatus } from '@/types/api';
+import { usePublicClient } from 'wagmi';
+import { parseAbiItem } from 'viem';
+import { CONTRACTS } from '@/lib/intent';
 
 export default function DashboardPage() {
   const { t } = useLanguage();
-  const { isAuthenticated } = useAuth();
+  const { address, isAuthenticated } = useAuth();
   const { data: buyOrders = [] } = useBuyOrders();
   const { data: sellOrders = [] } = useSellOrders();
   const { data: executions = [] } = useExecutions();
+  const publicClient = usePublicClient();
+  const [onChainTxs, setOnChainTxs] = useState<Record<string, string>>({}); // nonce -> txHash
+
+  // 嘗試從區塊鏈撈取 OrderExecuted event，來解決後端丟失 txHash 的問題
+  useEffect(() => {
+    async function fetchEvents() {
+      if (!publicClient || !address) return;
+      try {
+        const logs = await publicClient.getLogs({
+          address: CONTRACTS.SETTLEMENT_ROUTER as `0x${string}`,
+          event: parseAbiItem('event OrderExecuted(address indexed user, uint256 indexed nonce)'),
+          args: { user: address as `0x${string}` },
+          fromBlock: 'earliest',
+        });
+        
+        const txMap: Record<string, string> = {};
+        logs.forEach(log => {
+          if (log.args.nonce && log.transactionHash) {
+            txMap[log.args.nonce.toString()] = log.transactionHash;
+          }
+        });
+        setOnChainTxs(txMap);
+      } catch (err) {
+        console.error('Failed to fetch on-chain events:', err);
+      }
+    }
+    fetchEvents();
+  }, [publicClient, address]);
 
   // 合併買賣單為 ActiveOrdersTable 可用格式
-  const allOrders: AnyOrder[] = [
+  const allOrders = [
     ...buyOrders.map((o) => ({
       ...o,
       direction: 'BUY' as const,
@@ -27,13 +59,19 @@ export default function DashboardPage() {
     })),
   ].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
-  const getTxHash = (orderId: number, direction: 'BUY' | 'SELL') => {
+  const getTxHash = (orderId: number, direction: 'BUY' | 'SELL', nonce: number) => {
+    // 優先使用鏈上撈回來的 event txHash (以 nonce 比對)
+    if (nonce && onChainTxs[nonce.toString()]) {
+      return onChainTxs[nonce.toString()];
+    }
+
     if (direction === 'SELL') {
       const exec = executions.find(e => e.sellOrderId === orderId);
-      return exec ? exec.executionId : undefined;
+      // 如果 DB 裡面的 executionId 看起來像 tx hash 也回傳
+      if (exec?.executionId && exec.executionId.startsWith('0x')) {
+          return exec.executionId;
+      }
     }
-    // BUY orders currently don't map directly to executionId in the response model easily without an execution list specifically for buy_order, 
-    // but if relatedBy is implemented in the frontend model, we can try to find it. Currently execution model only has sellOrderId.
     return undefined;
   };
 
@@ -44,7 +82,7 @@ export default function DashboardPage() {
     amount: o.amount,
     status: o.status as OrderStatus,
     createdAt: o.createdAt,
-    txHash: getTxHash(o.orderId, o.direction),
+    txHash: getTxHash(o.orderId, o.direction, o.nonce),
   }));
 
   return (
