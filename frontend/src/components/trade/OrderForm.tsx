@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { useBuyOrder, useSellOrder } from '@/hooks/useOrders';
 import { useAuth } from '@/hooks/useAuth';
 import { useLanguage } from '@/contexts/LanguageContext';
-import { useWalletClient } from 'wagmi';
+import { useWalletClient, usePublicClient } from 'wagmi';
 import { buildSignedIntent, depositToVault } from '@/lib/intent';
 
 interface Props {
@@ -17,6 +17,7 @@ export function OrderForm({ onOrderSubmitted }: Props) {
   const { address, isAuthenticated } = useAuth();
   const { t } = useLanguage();
   const { data: walletClient } = useWalletClient();
+  const publicClient = usePublicClient();
   const [tab, setTab] = useState<'buy' | 'sell'>('sell');
   const [asset] = useState('WETH');
   const [amount, setAmount] = useState('');
@@ -56,6 +57,7 @@ export function OrderForm({ onOrderSubmitted }: Props) {
       setStep('depositing');
       await depositToVault({
         walletClient,
+        publicClient,
         user: address,
         side: tab,
         amount: amt,

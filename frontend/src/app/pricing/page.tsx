@@ -50,7 +50,9 @@ export default function PricingPage() {
       if (allowance < rawAmount) {
         // Step 1: Approve USDC
         setStep('approving');
-        await approvePriorityFee({ walletClient, user: address, amountUsdc: amount });
+        const hash = await approvePriorityFee({ walletClient, user: address, amountUsdc: amount });
+        // Wait for approve transaction to be mined
+        await publicClient.waitForTransactionReceipt({ hash });
       }
 
       // Step 2: Pay
@@ -67,7 +69,7 @@ export default function PricingPage() {
       setCurrentLevel(result.accountLevel);
       setSuccess(result.message);
     } catch (err) {
-      setError(err instanceof Error ? err.message : '升級失敗');
+      setError(err instanceof Error ? err.message : 'Upgrade failed');
     } finally {
       setStep('idle');
     }
