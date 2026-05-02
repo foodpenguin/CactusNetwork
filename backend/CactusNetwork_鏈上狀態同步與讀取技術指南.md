@@ -89,11 +89,11 @@ npx skills add uniswap/uniswap-ai --skill swap-integration
 
 #### rpc api = 請在 `.env` 設定 `SEPOLIA_RPC_URL` 或 `SP_TESTNET_RPC_URL`
 
-#### vault adress = 0x9a91A9928737246d90C1f98972fEaA0A4Fa8824D 
+#### vault adress = 0xF1Defe986257b2e8A74f40A48dbe3673268709f4 
 
-#### settlement router adress = 0x7343d4A63Da3a79D7a01CeA0545e54c86145d170
+#### settlement router adress = 0x98d83435F4aBcE9AdC2C1635125e5f627b7d73E0
 
-#### protocol treasury adress = 0x4031639e87d472D901465C82766F06A33a22bB8E
+#### protocol treasury adress = 0x20E8fcF701F6C2CDd74263Fa43989a80c9627c6C
 
 #### keeper address = 0x3219b06026e74d69f892a7ef87a542f882791615
 

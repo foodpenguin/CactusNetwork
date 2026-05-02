@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from Crypto.Hash import keccak
+
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_DIR / "data" / "databases"
@@ -54,6 +56,8 @@ SHELL_METACHARS = set(";|&$`()><\\'\"\n\r")
 BALANCE_OF_SELECTOR = "0x70a08231"
 VAULT_BALANCES_SELECTOR = "0xc23f001f"
 ROUTER_FILLED_AMOUNT_IN_SELECTOR = "0xec980a9c"
+INTENT_TYPE = "UserIntent(address user,address tokenIn,address tokenOut,uint256 amountIn,uint256 minAmountOut,uint256 deadline,bytes32 salt,bool allowPartialFill)"
+INTENT_TYPEHASH = "0x" + keccak.new(digest_bits=256, data=INTENT_TYPE.encode("utf-8")).hexdigest()
 
 
 def load_env_file(path: Path = ENV_FILE) -> None:
@@ -668,6 +672,149 @@ def read_erc20_balance_and_allowance(
         "balanceRaw": balance,
         "allowanceRaw": allowance,
     }
+
+
+def hash_intent(intent: dict[str, Any]) -> str:
+    """
+    依 `SettlementRouter.hashIntent()` 的 Solidity ABI 規則計算 UserIntent struct hash。
+
+    輸入：
+    - `intent`：包含 `user`、`tokenIn`、`tokenOut`、`amountIn`、`minAmountOut`、`deadline`、`salt`、`allowPartialFill` 的 dict。
+
+    輸出：
+    - 回傳 `0x` 開頭的 bytes32 intent hash，可直接查 `SettlementRouter.filledAmountIn(intentHash)`。
+
+    副作用：
+    - 無；只做本地 keccak256 計算。
+    """
+    _validate_user_intent(intent)
+    encoded_hex = "".join(
+        [
+            _encode_bytes32(INTENT_TYPEHASH),
+            _encode_address(str(intent["user"])),
+            _encode_address(str(intent["tokenIn"])),
+            _encode_address(str(intent["tokenOut"])),
+            _encode_uint256(intent["amountIn"]),
+            _encode_uint256(intent["minAmountOut"]),
+            _encode_uint256(intent["deadline"]),
+            _encode_bytes32(str(intent["salt"])),
+            _encode_bool(bool(intent["allowPartialFill"])),
+        ]
+    )
+    digest = keccak.new(digest_bits=256, data=bytes.fromhex(encoded_hex)).hexdigest()
+    return f"0x{digest}"
+
+
+def read_intent_execution_capacity(
+    intent: dict[str, Any],
+    execute_amount_in: Any,
+    rpc_url: Optional[str] = None,
+    vault_address: Optional[str] = None,
+    router_address: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    讀取單筆 intent 在鏈上是否還有足夠 vault 餘額與未成交額度。
+
+    輸入：
+    - `intent`：UserIntent dict。
+    - `execute_amount_in`：本次要消耗的 tokenIn raw amount。
+    - `rpc_url`：可選 RPC URL；未提供時讀 `.env`。
+    - `vault_address`：可選 IntentVault 地址；未提供時讀 `INTENT_VAULT_ADDRESS`。
+    - `router_address`：可選 SettlementRouter 地址；未提供時讀 `SETTLEMENT_ROUTER_ADDRESS`。
+
+    輸出：
+    - 回傳：
+      - `vaultBalance`：`IntentVault.balances(user, tokenIn)`。
+      - `filledAmountIn`：`SettlementRouter.filledAmountIn(intentHash)`。
+      - `remainingAmountIn`：`amountIn - filledAmountIn`。
+      - `hasEnoughVaultBalance`：vault 餘額是否足夠本次執行。
+      - `hasEnoughRemainingAmount`：intent 未成交額度是否足夠本次執行。
+      - `isExecutable`：兩者都足夠才為 true。
+
+    副作用：
+    - 發送兩次 JSON-RPC `eth_call`。
+    - 不送交易，不改鏈上狀態。
+    """
+    load_env_file()
+    _validate_user_intent(intent)
+    execute_amount = int(str(execute_amount_in))
+    if execute_amount <= 0:
+        raise ValueError("execute_amount_in 必須大於 0")
+
+    resolved_vault = vault_address or os.getenv("INTENT_VAULT_ADDRESS")
+    resolved_router = router_address or os.getenv("SETTLEMENT_ROUTER_ADDRESS")
+    if not _is_address(resolved_vault):
+        raise ValueError("缺少或無效 INTENT_VAULT_ADDRESS")
+    if not _is_address(resolved_router):
+        raise ValueError("缺少或無效 SETTLEMENT_ROUTER_ADDRESS")
+
+    intent_hash = hash_intent(intent)
+    vault_data = _call_data(
+        os.getenv("VAULT_BALANCES_SELECTOR", VAULT_BALANCES_SELECTOR),
+        [_encode_address(str(intent["user"])), _encode_address(str(intent["tokenIn"]))],
+    )
+    filled_data = _call_data(
+        os.getenv("ROUTER_FILLED_AMOUNT_IN_SELECTOR", ROUTER_FILLED_AMOUNT_IN_SELECTOR),
+        [_encode_bytes32(intent_hash)],
+    )
+    vault_balance = int(_decode_uint256(_eth_call(resolved_vault, vault_data, rpc_url)) or "0")
+    filled_amount = int(_decode_uint256(_eth_call(resolved_router, filled_data, rpc_url)) or "0")
+    amount_in = int(str(intent["amountIn"]))
+    remaining_amount = max(amount_in - filled_amount, 0)
+
+    has_vault = vault_balance >= execute_amount
+    has_remaining = remaining_amount >= execute_amount
+    return {
+        "intentHash": intent_hash,
+        "user": intent["user"],
+        "tokenIn": intent["tokenIn"],
+        "executeAmountIn": str(execute_amount),
+        "amountIn": str(amount_in),
+        "vaultBalance": str(vault_balance),
+        "filledAmountIn": str(filled_amount),
+        "remainingAmountIn": str(remaining_amount),
+        "hasEnoughVaultBalance": has_vault,
+        "hasEnoughRemainingAmount": has_remaining,
+        "isExecutable": has_vault and has_remaining,
+    }
+
+
+def _validate_user_intent(intent: dict[str, Any]) -> None:
+    """
+    檢查 UserIntent 是否具備鏈上讀取與 hash 所需欄位。
+
+    輸入：
+    - `intent`：UserIntent dict。
+
+    輸出：
+    - 驗證成功無回傳；失敗丟出 `ValueError`。
+    """
+    missing = [field for field in ("user", "tokenIn", "tokenOut", "amountIn", "minAmountOut", "deadline", "salt", "allowPartialFill") if intent.get(field) in (None, "")]
+    if missing:
+        raise ValueError("UserIntent 缺少欄位: " + ", ".join(missing))
+    for field in ("user", "tokenIn", "tokenOut"):
+        if not _is_address(str(intent[field])):
+            raise ValueError(f"UserIntent.{field} 不是有效 address")
+    for field in ("amountIn", "minAmountOut", "deadline"):
+        if int(str(intent[field])) < 0:
+            raise ValueError(f"UserIntent.{field} 不可為負數")
+    if not _is_bytes32(str(intent["salt"])):
+        raise ValueError("UserIntent.salt 不是有效 bytes32")
+    if not isinstance(intent["allowPartialFill"], bool):
+        raise ValueError("UserIntent.allowPartialFill 必須是 bool")
+
+
+def _encode_bool(value: bool) -> str:
+    """
+    ABI encode bool 參數。
+
+    輸入：
+    - `value`：布林值。
+
+    輸出：
+    - 32 bytes ABI slot hex，不含 `0x`。
+    """
+    return ("1" if value else "0").rjust(64, "0")
 
 
 def _decode_revert_reason(error_text: str) -> Optional[str]:

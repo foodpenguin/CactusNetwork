@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -20,12 +21,26 @@ ENV_FILE = PROJECT_DIR / ".env"
 ACCOUNTS_DB = DATA_DIR / "accounts.db"
 BUY_ORDERS_DB = DATA_DIR / "buy_orders.db"
 SELL_ORDERS_DB = DATA_DIR / "sell_orders.db"
+EXECUTIONS_DB = DATA_DIR / "executions.db"
 TOKEN_HOURS = 12
 DEFAULT_ACCOUNT_LEVEL = "free"
 DEFAULT_DAY = 0
 ORDER_STATUS_PENDING = "pending"
 DEFAULT_ATTEMPTS = 0
 SESSIONS: dict[str, tuple[str, datetime]] = {}
+REQUIRED_INTENT_FIELDS = (
+    "user",
+    "tokenIn",
+    "tokenOut",
+    "amountIn",
+    "minAmountOut",
+    "deadline",
+    "salt",
+    "allowPartialFill",
+)
+HEX_RE = re.compile(r"^0x[0-9a-fA-F]+$")
+ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+BYTES32_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 
 
 def _load_env() -> None:
@@ -322,6 +337,187 @@ def _require_account_from_token(authorization: str) -> tuple[str, str]:
     return account_name, row[0]
 
 
+def _validate_order_intent_or_raise(intent_json: Optional[dict[str, Any]], signature: Optional[str]) -> None:
+    """
+    驗證前端送進來的鏈上 intent 與簽名格式。
+
+    輸入：
+    - `intent_json`：前端根據 MetaMask / EIP-712 產生的 intent dict。
+    - `signature`：使用者錢包對該 intent 簽出的 0x hex 字串。
+
+    輸出：
+    - 驗證成功時無回傳值。
+
+    錯誤：
+    - 缺少 intent、缺少 signature、欄位不完整或格式錯誤時，拋出 HTTP 400。
+
+    注意：
+    - 這一層只檢查格式，不驗證鏈上餘額、allowance 或簽名真偽。
+    - 鏈上真實可執行性仍由後續 executor / KeeperHub / eth_call 負責。
+    """
+    if intent_json is None or signature is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="建立訂單必須同時提供 intent_json 與 signature",
+        )
+
+    missing_fields = [field for field in REQUIRED_INTENT_FIELDS if field not in intent_json]
+    if missing_fields:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"intent_json 缺少必要欄位：{', '.join(missing_fields)}",
+        )
+
+    invalid_fields: list[str] = []
+    for field in ("user", "tokenIn", "tokenOut"):
+        if not isinstance(intent_json.get(field), str) or not ADDRESS_RE.fullmatch(intent_json[field]):
+            invalid_fields.append(field)
+    for field in ("amountIn", "minAmountOut"):
+        if not _is_positive_integer_string(intent_json.get(field)):
+            invalid_fields.append(field)
+    if not isinstance(intent_json.get("deadline"), int) or intent_json["deadline"] <= 0:
+        invalid_fields.append("deadline")
+    if not isinstance(intent_json.get("salt"), str) or not BYTES32_RE.fullmatch(intent_json["salt"]):
+        invalid_fields.append("salt")
+    if not isinstance(intent_json.get("allowPartialFill"), bool):
+        invalid_fields.append("allowPartialFill")
+    if not isinstance(signature, str) or not HEX_RE.fullmatch(signature) or len(signature) < 4:
+        invalid_fields.append("signature")
+
+    if invalid_fields:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"intent_json/signature 格式錯誤：{', '.join(invalid_fields)}",
+        )
+
+
+def _is_positive_integer_string(value: Any) -> bool:
+    """
+    檢查鏈上數量欄位是否為正整數字串。
+
+    輸入：
+    - `value`：任意值。
+
+    輸出：
+    - `True`：value 是大於 0 的十進位整數字串。
+    - `False`：value 不是可作為 uint256 raw amount 的字串。
+    """
+    return isinstance(value, str) and value.isdigit() and int(value) > 0
+
+
+def _buy_order_row_to_response(row: sqlite3.Row) -> dict[str, Any]:
+    """
+    將 buy_orders DB row 轉成公開 API 回傳格式。
+
+    輸入：
+    - `row`：一筆 `buy_orders` 查詢結果。
+
+    輸出：
+    - dict：前端可讀的買單狀態，不包含完整 intent 或 signature。
+    """
+    return {
+        "direction": "BUY",
+        "orderId": row["id"],
+        "buyOrderId": row["id"],
+        "accountName": row["account_name"],
+        "accountLevelSnapshot": row["account_level_snapshot"],
+        "asset": row["asset"],
+        "amount": row["amount"],
+        "remainingAmount": row["remaining_amount"],
+        "maxUnitPriceUsdc": row["max_unit_price_usdc"],
+        "maxSplits": row["max_splits"],
+        "maxFeePercent": row["max_fee_percent"],
+        "status": row["status"],
+        "attempts": row["attempts"],
+        "operationNote": row["operation_note"],
+        "hasIntent": row["intent_json"] is not None,
+        "hasSignature": row["signature"] is not None,
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def _sell_order_row_to_response(row: sqlite3.Row) -> dict[str, Any]:
+    """
+    將 sell_orders DB row 轉成公開 API 回傳格式。
+
+    輸入：
+    - `row`：一筆 `sell_orders` 查詢結果。
+
+    輸出：
+    - dict：前端可讀的賣單狀態，不包含完整 intent 或 signature。
+    """
+    return {
+        "direction": "SELL",
+        "orderId": row["id"],
+        "sellOrderId": row["id"],
+        "accountName": row["account_name"],
+        "accountLevelSnapshot": row["account_level_snapshot"],
+        "asset": row["asset"],
+        "amount": row["amount"],
+        "remainingAmount": row["remaining_amount"],
+        "minUnitPriceUsdc": row["min_unit_price_usdc"],
+        "maxSplits": row["max_splits"],
+        "maxFeePercent": row["max_fee_percent"],
+        "status": row["status"],
+        "attempts": row["attempts"],
+        "operationNote": row["operation_note"],
+        "hasIntent": row["intent_json"] is not None,
+        "hasSignature": row["signature"] is not None,
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+        "queueAt": row["queue_at"],
+    }
+
+
+def _execution_row_to_response(row: sqlite3.Row, related_by: str) -> dict[str, Any]:
+    """
+    將 executions DB row 轉成公開 API 回傳格式。
+
+    輸入：
+    - `row`：一筆 `executions` 查詢結果。
+    - `related_by`：此 execution 與使用者的關係，可能是 `sell_order` 或 `buy_order`。
+
+    輸出：
+    - dict：前端可讀的 execution 狀態摘要。
+    """
+    return {
+        "executionId": row["execution_id"],
+        "sellOrderId": row["sell_order_id"],
+        "status": row["status"],
+        "failureReason": row["failure_reason"],
+        "relatedBy": related_by,
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+        "confirmedAt": row["confirmed_at"],
+    }
+
+
+def _execution_mentions_buy_order(row: sqlite3.Row, buy_order_ids: set[int]) -> bool:
+    """
+    檢查 execution proposal 是否包含目前使用者的買單。
+
+    輸入：
+    - `row`：一筆 executions 查詢結果，需包含 `proposal_json`。
+    - `buy_order_ids`：目前使用者擁有的買單 id 集合。
+
+    輸出：
+    - `True`：proposal 的 `matches[].buyOrderId` 命中使用者買單。
+    - `False`：未命中或 proposal JSON 無法解析。
+    """
+    try:
+        proposal = json.loads(row["proposal_json"])
+    except (TypeError, json.JSONDecodeError):
+        return False
+    for match in proposal.get("matches") or []:
+        try:
+            if int(match.get("buyOrderId")) in buy_order_ids:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 _load_env()
 _init_databases()
 
@@ -379,11 +575,11 @@ class BuyOrderRequest(BaseModel):
     max_fee_percent: float = Field(ge=0, description="可接受的最高交易手續費百分比。", examples=[0.3])
     intent_json: Optional[dict[str, Any]] = Field(
         default=None,
-        description="前端 MetaMask 簽名流程產生的鏈上 intent JSON；尚未接錢包時可省略。",
+        description="前端 MetaMask 簽名流程產生的鏈上 intent JSON；建立訂單時必填。",
     )
     signature: Optional[str] = Field(
         default=None,
-        description="使用者對 intent 的錢包簽名；尚未接錢包時可省略。",
+        description="使用者對 intent 的錢包簽名；建立訂單時必填。",
     )
 
     model_config = ConfigDict(extra="forbid")
@@ -406,11 +602,11 @@ class SellOrderRequest(BaseModel):
     max_fee_percent: float = Field(ge=0, description="可接受的最高交易手續費百分比。", examples=[0.3])
     intent_json: Optional[dict[str, Any]] = Field(
         default=None,
-        description="前端 MetaMask 簽名流程產生的鏈上 intent JSON；尚未接錢包時可省略。",
+        description="前端 MetaMask 簽名流程產生的鏈上 intent JSON；建立訂單時必填。",
     )
     signature: Optional[str] = Field(
         default=None,
-        description="使用者對 intent 的錢包簽名；尚未接錢包時可省略。",
+        description="使用者對 intent 的錢包簽名；建立訂單時必填。",
     )
 
     model_config = ConfigDict(extra="forbid")
@@ -418,7 +614,7 @@ class SellOrderRequest(BaseModel):
 
 app = FastAPI(
     title="交易輸入最小 API",
-    description="目前只提供四個公開方法：建立帳號、登入帳號、建立買單、建立賣單。",
+    description="公開方法包含帳號、登入、建立買賣單，以及登入後查詢自己的訂單與執行狀態。",
     version="0.1.0",
 )
 
@@ -558,6 +754,7 @@ def create_buy_order(payload: BuyOrderRequest, authorization: str = Header(defau
     - 新建買單的 `operation_note` 保持空字串，只有中控實際處理後才會寫入。
     """
     account_name, account_level = _require_account_from_token(authorization)
+    _validate_order_intent_or_raise(payload.intent_json, payload.signature)
     now = datetime.now(timezone.utc).isoformat()
 
     with sqlite3.connect(BUY_ORDERS_DB) as conn:
@@ -649,6 +846,7 @@ def create_sell_order(payload: SellOrderRequest, authorization: str = Header(def
     - 賣單會進入中控佇列；SQL 表本身無序，實際佇列順序由中控查詢 `ORDER BY queue_at, id` 決定。
     """
     account_name, account_level = _require_account_from_token(authorization)
+    _validate_order_intent_or_raise(payload.intent_json, payload.signature)
     now = datetime.now(timezone.utc).isoformat()
 
     with sqlite3.connect(SELL_ORDERS_DB) as conn:
@@ -712,3 +910,119 @@ def create_sell_order(payload: SellOrderRequest, authorization: str = Header(def
         "createdAt": now,
         "queueAt": now,
     }
+
+
+@app.get("/buy-orders", summary="查詢自己的買單")
+def list_my_buy_orders(authorization: str = Header(default="")) -> list[dict[str, Any]]:
+    """
+    查詢目前登入帳號建立過的買單。
+
+    輸入：
+    - Header：`Authorization: Bearer <accessToken>`。
+
+    輸出：
+    - list[dict]：依 `id` 由新到舊排列的買單狀態。
+    - 每筆包含 `remainingAmount`、`status`、`attempts`、`operationNote` 等可供前端顯示的欄位。
+
+    副作用：
+    - 無；此函式只讀取 `buy_orders.db`。
+    """
+    account_name, _ = _require_account_from_token(authorization)
+    with sqlite3.connect(BUY_ORDERS_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM buy_orders
+            WHERE account_name = ?
+            ORDER BY id DESC
+            """,
+            (account_name,),
+        ).fetchall()
+    return [_buy_order_row_to_response(row) for row in rows]
+
+
+@app.get("/sell-orders", summary="查詢自己的賣單")
+def list_my_sell_orders(authorization: str = Header(default="")) -> list[dict[str, Any]]:
+    """
+    查詢目前登入帳號建立過的賣單。
+
+    輸入：
+    - Header：`Authorization: Bearer <accessToken>`。
+
+    輸出：
+    - list[dict]：依 `id` 由新到舊排列的賣單狀態。
+    - 每筆包含 `remainingAmount`、`status`、`attempts`、`operationNote`、`queueAt`。
+
+    副作用：
+    - 無；此函式只讀取 `sell_orders.db`。
+    """
+    account_name, _ = _require_account_from_token(authorization)
+    with sqlite3.connect(SELL_ORDERS_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM sell_orders
+            WHERE account_name = ?
+            ORDER BY id DESC
+            """,
+            (account_name,),
+        ).fetchall()
+    return [_sell_order_row_to_response(row) for row in rows]
+
+
+@app.get("/executions", summary="查詢自己的交易執行狀態")
+def list_my_executions(authorization: str = Header(default="")) -> list[dict[str, Any]]:
+    """
+    查詢目前登入帳號相關的 execution 狀態。
+
+    輸入：
+    - Header：`Authorization: Bearer <accessToken>`。
+
+    輸出：
+    - list[dict]：依 execution 建立順序由新到舊排列。
+    - 賣方帳號會看到以自己賣單建立的 executions。
+    - 買方帳號會看到 proposal `matches[].buyOrderId` 命中的 executions。
+
+    副作用：
+    - 無；此函式只讀取 `sell_orders.db`、`buy_orders.db`、`executions.db`。
+    """
+    account_name, _ = _require_account_from_token(authorization)
+
+    with sqlite3.connect(SELL_ORDERS_DB) as conn:
+        sell_order_ids = {
+            int(row[0])
+            for row in conn.execute("SELECT id FROM sell_orders WHERE account_name = ?", (account_name,)).fetchall()
+        }
+    with sqlite3.connect(BUY_ORDERS_DB) as conn:
+        buy_order_ids = {
+            int(row[0])
+            for row in conn.execute("SELECT id FROM buy_orders WHERE account_name = ?", (account_name,)).fetchall()
+        }
+
+    if not EXECUTIONS_DB.exists():
+        return []
+
+    with sqlite3.connect(EXECUTIONS_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM executions
+            ORDER BY id DESC
+            """
+        ).fetchall()
+
+    result: list[dict[str, Any]] = []
+    seen_execution_ids: set[str] = set()
+    for row in rows:
+        related_by = ""
+        if int(row["sell_order_id"]) in sell_order_ids:
+            related_by = "sell_order"
+        elif _execution_mentions_buy_order(row, buy_order_ids):
+            related_by = "buy_order"
+        if related_by and row["execution_id"] not in seen_execution_ids:
+            result.append(_execution_row_to_response(row, related_by))
+            seen_execution_ids.add(row["execution_id"])
+    return result

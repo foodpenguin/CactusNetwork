@@ -634,14 +634,14 @@ def confirm_execution(execution_id: str, confirmation: dict[str, Any]) -> dict[s
     - `execution_id`：`record_execution_proposal()` 建立的成交單 id。
     - `confirmation`：執行器回覆 dict。
       - `status = confirmed` 時，會套用成交結果。
-      - `status = failed` 時，只標記成交單失敗，不改訂單。
+      - `status = failed` 時，標記成交單失敗，並讓 pending 賣單增加一次嘗試。
 
     輸出：
     - 回傳 execution 更新摘要與必要時的訂單套用結果。
 
     副作用：
     - `confirmed`：呼叫內部 matched 套用流程，才扣除 `remaining_amount` 並更新訂單狀態。
-    - `failed`：只更新 `executions.db`，不修改買賣單。
+    - `failed`：更新 `executions.db`，不扣買賣單；若賣單仍 pending，`attempts + 1` 並回隊尾，達上限則 invalid。
     """
     _ensure_databases()
     confirmed_at = _now().isoformat()
@@ -659,13 +659,15 @@ def confirm_execution(execution_id: str, confirmation: dict[str, Any]) -> dict[s
         raise ValueError(f"execution_id={execution_id} 目前狀態不是 proposed 或 dispatched")
 
     if confirmation_status == "failed":
-        failure_reason = str(confirmation.get("failureReason") or "execution failed")
+        failure_reason = str(confirmation.get("failureReason") or confirmation.get("failure_reason") or "execution failed")
+        apply_result = _apply_failed_execution_to_sell_order(execution, failure_reason)
         with sqlite3.connect(EXECUTIONS_DB) as conn:
             conn.execute(
                 """
                 UPDATE executions
                 SET status = 'failed',
                     confirmation_json = ?,
+                    apply_result_json = ?,
                     failure_reason = ?,
                     updated_at = ?,
                     confirmed_at = ?
@@ -673,6 +675,7 @@ def confirm_execution(execution_id: str, confirmation: dict[str, Any]) -> dict[s
                 """,
                 (
                     json.dumps(confirmation, ensure_ascii=False, sort_keys=True),
+                    json.dumps(apply_result, ensure_ascii=False, sort_keys=True),
                     failure_reason,
                     confirmed_at,
                     confirmed_at,
@@ -685,7 +688,7 @@ def confirm_execution(execution_id: str, confirmation: dict[str, Any]) -> dict[s
             "executionId": execution_id,
             "executionStatus": "failed",
             "failureReason": failure_reason,
-            "applyResult": None,
+            "applyResult": apply_result,
         }
 
     if confirmation_status != "confirmed":
@@ -1802,6 +1805,73 @@ def _apply_invalid_decision(decision: dict[str, Any]) -> dict[str, Any]:
         "decisionStatus": "invalid",
         "sellOrderId": sell_order_id,
         "sellOrderStatus": "invalid",
+    }
+
+
+def _apply_failed_execution_to_sell_order(execution: sqlite3.Row, failure_reason: str) -> dict[str, Any]:
+    """
+    將鏈上 / KeeperHub execution 失敗反映到對應賣單的重試計數。
+
+    輸入：
+    - `execution`：`executions.db` 中仍處於 proposed / dispatched 的 row。
+    - `failure_reason`：鏈上 worker 或 KeeperHub 回報的失敗原因。
+
+    輸出：
+    - 回傳本次是否更新賣單，以及更新後狀態。
+
+    副作用：
+    - 不扣買單或賣單 `remaining_amount`。
+    - 若賣單仍是 `pending`，`attempts + 1`。
+    - 未達上限時維持 `pending` 並更新 `queue_at`，讓賣單回隊尾。
+    - 達 `MAX_ATTEMPTS` 時改成 `invalid`，避免鏈上失敗無限重試。
+    - 若賣單已 timeout / filled / invalid，只記錄 skipped，不再修改訂單。
+    """
+    sell_order_id = execution["sell_order_id"]
+    if sell_order_id is None:
+        return {
+            "status": "execution_failed_order_update_skipped",
+            "reason": "missing_sell_order_id",
+            "failureReason": failure_reason,
+        }
+
+    sell_order = _load_order_or_raise(SELL_ORDERS_DB, "sell_orders", int(sell_order_id))
+    if sell_order["status"] != "pending":
+        return {
+            "status": "execution_failed_order_update_skipped",
+            "sellOrderId": int(sell_order_id),
+            "sellOrderStatus": sell_order["status"],
+            "reason": "sell_order_not_pending",
+            "failureReason": failure_reason,
+        }
+
+    attempts = int(sell_order["attempts"]) + 1
+    new_status = "invalid" if attempts >= MAX_ATTEMPTS else "pending"
+    now = _now().isoformat()
+    note = _append_note(
+        sell_order["operation_note"],
+        (
+            f"execution_failed: reason={failure_reason}，attempts={attempts}"
+            + ("，已達上限，標記 invalid" if new_status == "invalid" else "，賣單回到隊尾")
+        ),
+    )
+
+    with sqlite3.connect(SELL_ORDERS_DB) as conn:
+        conn.execute(
+            """
+            UPDATE sell_orders
+            SET attempts = ?, status = ?, operation_note = ?, updated_at = ?, queue_at = ?
+            WHERE id = ?
+            """,
+            (attempts, new_status, note, now, now, int(sell_order_id)),
+        )
+        conn.commit()
+
+    return {
+        "status": "execution_failed_order_updated",
+        "sellOrderId": int(sell_order_id),
+        "sellOrderStatus": new_status,
+        "attempts": attempts,
+        "failureReason": failure_reason,
     }
 
 

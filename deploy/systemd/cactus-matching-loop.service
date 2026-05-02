@@ -1,0 +1,16 @@
+[Unit]
+Description=CactusNetwork Grok matching loop
+After=network-online.target cactus-public-api.service cactus-internal-api.service cactus-execution-reconciler.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ark009770
+WorkingDirectory=/home/ark009770/CactusNetwork/backend
+EnvironmentFile=/home/ark009770/CactusNetwork/backend/.env
+ExecStart=/home/ark009770/CactusNetwork/backend/.venv/bin/python -u -m scripts.matching_service loop --agent grok --candidate-limit 5 --interval-seconds 60 --emit-json-lines
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
