@@ -138,6 +138,15 @@ def make_payload(deadline: int = 1999999999) -> dict:
     }
 
 
+def make_external_dex_payload(deadline: int = 1999999999) -> dict:
+    """建立 actionType=0 的外部 DEX payload。"""
+    payload = make_payload(deadline=deadline)
+    payload["actionType"] = 0
+    payload["routeDetails"]["Calldata"] = "0x04e45aaf"
+    payload["routeDetails"]["matchedIntentB"] = None
+    return payload
+
+
 def create_execution(payload: dict) -> tuple[str, int, int]:
     """建立 proposed execution 測試資料。"""
     buy_id = insert_buy_order()
@@ -206,6 +215,29 @@ def test_reconcile_expires_deadline_passed_execution(monkeypatch: pytest.MonkeyP
     assert result["summary"]["expiredCount"] == 1
     assert result["summary"]["dispatchedCount"] == 0
     assert "deadline" in result["expired"][0]["confirmResult"]["failureReason"]
+    assert fetch_execution_status(execution_id) == "failed"
+
+
+def test_external_dex_payload_does_not_require_matched_intent_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """測試 actionType=0 外部 DEX payload 不會檢查 matchedIntentB deadline。"""
+    execution_id, _, _ = create_execution(make_external_dex_payload())
+    captured: dict[str, object] = {}
+
+    def fake_post_json(url: str, posted_payload: dict, timeout_seconds: float, extra_headers: dict) -> dict:
+        captured["payload"] = posted_payload
+        return {
+            "httpStatusCode": 200,
+            "body": {"status": "failed", "error": "mock keeperhub failed after dispatch"},
+        }
+
+    monkeypatch.setattr(execution_messages, "_post_json", fake_post_json)
+
+    result = execution_reconciler.reconcile_keeperhub_executions(limit=5)
+
+    assert result["summary"]["expiredCount"] == 0
+    assert result["summary"]["dispatchedCount"] == 1
+    assert captured["payload"]["actionType"] == 0
+    assert captured["payload"]["routeDetails"]["matchedIntentB"] is None
     assert fetch_execution_status(execution_id) == "failed"
 
 

@@ -1,9 +1,10 @@
 import json
 import sqlite3
-import uuid
 from pathlib import Path
 
 import pytest
+from eth_account import Account
+from eth_account.messages import encode_defunct
 from fastapi.testclient import TestClient
 
 from scripts import api_server
@@ -24,51 +25,51 @@ def isolated_api_databases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(api_server, "EXECUTIONS_DB", data_dir / "executions.db")
 
     api_server.SESSIONS.clear()
+    api_server.NONCES.clear()
     api_server._init_databases()
 
 
 def clear_databases() -> None:
     """清空測試會碰到的資料表，讓每次測試從乾淨狀態開始。"""
     api_server.SESSIONS.clear()
+    api_server.NONCES.clear()
     for db_path, table_name in [
         (api_server.ACCOUNTS_DB, "accounts"),
         (api_server.BUY_ORDERS_DB, "buy_orders"),
         (api_server.SELL_ORDERS_DB, "sell_orders"),
+        (api_server.EXECUTIONS_DB, "executions"),
     ]:
+        if not db_path.exists():
+            continue
         with sqlite3.connect(db_path) as conn:
             conn.execute(f"DELETE FROM {table_name}")
             conn.commit()
 
 
-def unique_account_name(prefix: str = "test_user") -> str:
-    """產生唯一測試帳號，避免撞到本機既有資料。"""
-    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+def _signature_hex(raw_signature: bytes) -> str:
+    """將 eth-account 回傳的簽名字節轉成 0x hex 字串。"""
+    signature = raw_signature.hex()
+    return signature if signature.startswith("0x") else f"0x{signature}"
 
 
-def create_account_and_login() -> tuple[str, str]:
-    """建立帳號並登入，回傳帳號名稱與 Bearer token。"""
-    account_name = unique_account_name()
-    password = "test_password_123"
+def create_wallet_and_login() -> tuple[str, str]:
+    """建立測試錢包、簽 nonce 登入，回傳標準化錢包地址與 Bearer token。"""
+    account = Account.create()
 
-    response = client.post(
-        "/accounts",
-        json={
-            "account_name": account_name,
-            "password": password,
-            "public_key": "0xTestPublicKey",
-        },
-    )
-    assert response.status_code == 200
+    nonce_response = client.get("/auth/nonce", params={"address": account.address})
+    assert nonce_response.status_code == 200
+    nonce = nonce_response.json()["nonce"]
 
+    signed = Account.sign_message(encode_defunct(text=nonce), account.key)
     response = client.post(
         "/login",
         json={
-            "account_name": account_name,
-            "password": password,
+            "address": account.address,
+            "signature": _signature_hex(signed.signature),
         },
     )
     assert response.status_code == 200
-    return account_name, response.json()["accessToken"]
+    return account.address.lower(), response.json()["accessToken"]
 
 
 def valid_intent(user: str = "0x1111111111111111111111111111111111111111") -> dict:
@@ -90,84 +91,74 @@ def valid_signature() -> str:
     return "0x" + "cd" * 65
 
 
-def test_create_account_success_and_defaults() -> None:
-    """測試建立帳號成功，且 account_level/day 使用系統預設值。"""
+def test_wallet_login_auto_creates_account_success_and_defaults() -> None:
+    """測試錢包簽名登入會自動建立帳號，且 account_level/day 使用系統預設值。"""
     clear_databases()
-    account_name = unique_account_name()
+    account = Account.create()
+    nonce = client.get("/auth/nonce", params={"address": account.address}).json()["nonce"]
+    signed = Account.sign_message(encode_defunct(text=nonce), account.key)
 
     response = client.post(
-        "/accounts",
+        "/login",
         json={
-            "account_name": account_name,
-            "password": "test_password_123",
-            "public_key": "0xAccountPublicKey",
+            "address": account.address,
+            "signature": _signature_hex(signed.signature),
         },
     )
 
     assert response.status_code == 200
     data = response.json()
-    assert data["accountName"] == account_name
-    assert data["publicKey"] == "0xAccountPublicKey"
+    assert data["walletAddress"] == account.address.lower()
     assert data["accountLevel"] == "free"
-    assert data["day"] == 0
+    assert data["tokenType"] == "Bearer"
+    assert data["accessToken"]
 
     with sqlite3.connect(api_server.ACCOUNTS_DB) as conn:
         row = conn.execute(
-            "SELECT account_name, public_key, account_level, day FROM accounts WHERE account_name = ?",
-            (account_name,),
+            "SELECT wallet_address, account_level, day FROM accounts WHERE wallet_address = ?",
+            (account.address.lower(),),
         ).fetchone()
-    assert row == (account_name, "0xAccountPublicKey", "free", 0)
+    assert row == (account.address.lower(), "free", 0)
 
 
-def test_create_account_rejects_frontend_only_fields() -> None:
-    """測試建立帳號時，前端不能傳 account_level 或 day。"""
+def test_wallet_login_rejects_invalid_address_and_wrong_signature() -> None:
+    """測試登入會拒絕錯誤地址格式與地址不相符的簽名。"""
     clear_databases()
 
-    response = client.post(
-        "/accounts",
-        json={
-            "account_name": unique_account_name("bad_level"),
-            "password": "test_password_123",
-            "public_key": "0xBadLevel",
-            "account_level": "admin",
-        },
-    )
-    assert response.status_code == 422
+    response = client.get("/auth/nonce", params={"address": "not-an-address"})
+    assert response.status_code == 400
 
+    account = Account.create()
+    other_account = Account.create()
+    nonce = client.get("/auth/nonce", params={"address": account.address}).json()["nonce"]
+    signed = Account.sign_message(encode_defunct(text=nonce), other_account.key)
     response = client.post(
-        "/accounts",
+        "/login",
         json={
-            "account_name": unique_account_name("bad_day"),
-            "password": "test_password_123",
-            "public_key": "0xBadDay",
-            "day": 10,
+            "address": account.address,
+            "signature": _signature_hex(signed.signature),
         },
     )
-    assert response.status_code == 422
+    assert response.status_code == 401
 
 
 def test_login_success_and_failure() -> None:
-    """測試登入成功會回 token，錯誤密碼會被拒絕。"""
+    """測試錢包登入成功會回 token，重複使用 nonce 會被拒絕。"""
     clear_databases()
-    account_name = unique_account_name()
-    password = "test_password_123"
-    client.post(
-        "/accounts",
-        json={
-            "account_name": account_name,
-            "password": password,
-            "public_key": "0xLoginPublicKey",
-        },
-    )
+    account = Account.create()
+    nonce = client.get("/auth/nonce", params={"address": account.address}).json()["nonce"]
+    signed = Account.sign_message(encode_defunct(text=nonce), account.key)
+    signature = _signature_hex(signed.signature)
 
-    response = client.post("/login", json={"account_name": account_name, "password": password})
+    response = client.post("/login", json={"address": account.address, "signature": signature})
     assert response.status_code == 200
     data = response.json()
     assert data["tokenType"] == "Bearer"
     assert data["accessToken"]
     assert data["expiresAt"]
+    assert data["walletAddress"] == account.address.lower()
 
-    response = client.post("/login", json={"account_name": account_name, "password": "wrong_password"})
+    response = client.post("/login", json={"address": account.address, "signature": signature})
     assert response.status_code == 401
 
 
@@ -207,7 +198,7 @@ def test_buy_and_sell_orders_require_login() -> None:
 def test_create_buy_order_success_and_database_defaults() -> None:
     """測試登入後可建立買單，且 DB 預設值正確。"""
     clear_databases()
-    account_name, token = create_account_and_login()
+    account_name, token = create_wallet_and_login()
 
     response = client.post(
         "/buy-orders",
@@ -247,7 +238,7 @@ def test_create_buy_order_success_and_database_defaults() -> None:
 def test_create_sell_order_success_and_database_defaults() -> None:
     """測試登入後可建立賣單，且 DB 預設值正確。"""
     clear_databases()
-    account_name, token = create_account_and_login()
+    account_name, token = create_wallet_and_login()
 
     response = client.post(
         "/sell-orders",
@@ -288,7 +279,7 @@ def test_create_sell_order_success_and_database_defaults() -> None:
 def test_orders_can_store_frontend_intent_and_signature() -> None:
     """測試買單/賣單可保存前端 MetaMask intent_json 與 signature。"""
     clear_databases()
-    _, token = create_account_and_login()
+    _, token = create_wallet_and_login()
     buy_intent = valid_intent("0x4444444444444444444444444444444444444444")
     sell_intent = valid_intent("0x5555555555555555555555555555555555555555")
 
@@ -346,7 +337,7 @@ def test_orders_can_store_frontend_intent_and_signature() -> None:
 def test_create_order_rejects_incomplete_intent_before_insert() -> None:
     """測試建單時會先擋掉不完整 intent，避免壞單進入中控。"""
     clear_databases()
-    _, token = create_account_and_login()
+    _, token = create_wallet_and_login()
 
     response = client.post(
         "/sell-orders",
@@ -373,7 +364,7 @@ def test_create_order_rejects_incomplete_intent_before_insert() -> None:
 def test_create_order_requires_signature_with_intent() -> None:
     """測試建單時 intent 與 signature 必須一起提供。"""
     clear_databases()
-    _, token = create_account_and_login()
+    _, token = create_wallet_and_login()
 
     response = client.post(
         "/buy-orders",
@@ -395,7 +386,7 @@ def test_create_order_requires_signature_with_intent() -> None:
 def test_user_can_list_own_orders() -> None:
     """測試登入使用者可以查詢自己的買單與賣單狀態。"""
     clear_databases()
-    account_name, token = create_account_and_login()
+    account_name, token = create_wallet_and_login()
 
     buy_response = client.post(
         "/buy-orders",
@@ -440,8 +431,8 @@ def test_user_can_list_own_orders() -> None:
 def test_user_can_list_related_executions_for_sell_and_buy_orders() -> None:
     """測試使用者可以查到自己賣單或買單相關的 execution 狀態。"""
     clear_databases()
-    seller_name, seller_token = create_account_and_login()
-    _, buyer_token = create_account_and_login()
+    seller_name, seller_token = create_wallet_and_login()
+    _, buyer_token = create_wallet_and_login()
 
     sell_response = client.post(
         "/sell-orders",
@@ -531,7 +522,7 @@ def test_user_can_list_related_executions_for_sell_and_buy_orders() -> None:
 
     assert seller_executions.json()[0]["sellOrderId"] == sell_response.json()["sellOrderId"]
     assert seller_executions.json()[0]["status"] == "failed"
-    assert seller_name.startswith("test_user_")
+    assert seller_name.startswith("0x")
 
 
 def test_openapi_exposes_public_methods() -> None:
@@ -539,7 +530,19 @@ def test_openapi_exposes_public_methods() -> None:
     response = client.get("/openapi.json")
     assert response.status_code == 200
     paths = response.json()["paths"]
-    assert set(paths.keys()) == {"/accounts", "/login", "/buy-orders", "/sell-orders", "/executions"}
+    assert set(paths.keys()) == {
+        "/auth/nonce",
+        "/account/me",
+        "/login",
+        "/account/upgrade",
+        "/buy-orders",
+        "/sell-orders",
+        "/executions",
+    }
+    assert set(paths["/auth/nonce"].keys()) == {"get"}
+    assert set(paths["/account/me"].keys()) == {"get"}
+    assert set(paths["/login"].keys()) == {"post"}
+    assert set(paths["/account/upgrade"].keys()) == {"post"}
     assert set(paths["/buy-orders"].keys()) == {"get", "post"}
     assert set(paths["/sell-orders"].keys()) == {"get", "post"}
     assert set(paths["/executions"].keys()) == {"get"}

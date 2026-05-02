@@ -366,11 +366,65 @@ def validate_grok_decision(decision: dict[str, Any], task: dict[str, Any]) -> di
         external_query.setdefault("amount", task["sellOrder"].get("remainingAmount"))
         external_query.setdefault("minUnitPriceUsdc", task["sellOrder"].get("minUnitPriceUsdc"))
         external_query.setdefault("syncTargets", [])
+        if not external_query["syncTargets"]:
+            external_query["syncTargets"] = _build_uniswap_sync_targets_from_task_sell_order(task["sellOrder"])
     else:
         normalized.setdefault("failureReason", "Grok 主腦未提供原因")
 
     normalized.setdefault("decisionChain", [])
     return normalized
+
+
+def _build_uniswap_sync_targets_from_task_sell_order(sell_order: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    從本輪賣單 payload 補齊外部 Uniswap V3 查詢目標。
+
+    輸入：
+    - `sell_order`：`prepare_agent_task()` 交給 Grok 的 `sellOrder` payload。
+
+    輸出：
+    - 若賣單 `intentJson` 有 `user`、`tokenIn`、`tokenOut`、`amountIn`，回傳一筆 Uniswap target。
+    - 若欄位不足，回傳空 list，讓外部查詢明確呈現 `no_targets`。
+
+    用途：
+    - Grok 負責判斷是否需要外部資料。
+    - 後端負責把已簽署 intent 轉成穩定的 Uniswap API 查詢格式，避免 Grok 漏填 `syncTargets`。
+    """
+    raw_intent = sell_order.get("intentJson") if isinstance(sell_order.get("intentJson"), dict) else {}
+    user = raw_intent.get("user")
+    token_in = raw_intent.get("tokenIn")
+    token_out = raw_intent.get("tokenOut")
+    amount_in = raw_intent.get("amountIn")
+    if not all([user, token_in, token_out, amount_in]):
+        return []
+
+    target: dict[str, Any] = {
+        "intentId": f"sell-order-{sell_order['id']}-uniswap-v3",
+        "user": user,
+        "swapper": raw_intent.get("swapper") or user,
+        "recipient": raw_intent.get("recipient") or user,
+        "tokenIn": token_in,
+        "tokenOut": token_out,
+        "amount": str(amount_in),
+        "amountIn": str(amount_in),
+        "buildCalldata": True,
+        "buildApprovalCheck": True,
+        "protocols": ["V3"],
+    }
+    for source_key, target_key in (
+        ("chainId", "chainId"),
+        ("tokenInChainId", "tokenInChainId"),
+        ("tokenOutChainId", "tokenOutChainId"),
+        ("fee", "fee"),
+        ("priceLimit", "priceLimit"),
+        ("sqrtPriceLimitX96", "sqrtPriceLimitX96"),
+        ("slippageTolerance", "slippageTolerance"),
+        ("routingPreference", "routingPreference"),
+        ("urgency", "urgency"),
+    ):
+        if raw_intent.get(source_key) is not None:
+            target[target_key] = raw_intent[source_key]
+    return [target]
 
 
 def _is_external_dex_payload(payload: dict[str, Any]) -> bool:

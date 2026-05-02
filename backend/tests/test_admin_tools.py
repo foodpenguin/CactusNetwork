@@ -28,19 +28,30 @@ def isolated_admin_databases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(orchestrator_server, "EXECUTIONS_DB", data_dir / "executions.db")
 
     api_server.SESSIONS.clear()
+    api_server.NONCES.clear()
     api_server._init_databases()
     orchestrator_server._ensure_databases()
 
 
-def create_account(account_name: str = "alice") -> None:
-    """建立測試帳號。"""
-    api_server.create_account(
-        api_server.CreateAccountRequest(
-            account_name=account_name,
-            password="pw123456",
-            public_key=f"0x{account_name}",
+def create_account(wallet_address: str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") -> str:
+    """建立測試錢包帳號並回傳標準化地址。"""
+    now = datetime.now(timezone.utc).isoformat()
+    normalized = wallet_address.lower()
+    with sqlite3.connect(api_server.ACCOUNTS_DB) as conn:
+        conn.execute(
+            """
+            INSERT INTO accounts (wallet_address, account_level, day, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                normalized,
+                "free",
+                0,
+                now,
+            ),
         )
-    )
+        conn.commit()
+    return normalized
 
 
 def insert_buy_order(account_name: str = "buyer") -> int:
@@ -102,17 +113,16 @@ def insert_sell_order(account_name: str = "seller") -> int:
 
 def test_admin_can_update_account_level_and_day_without_exposing_password_hash() -> None:
     """測試後台可調整帳號等級與 day，查詢時不暴露密碼 hash/salt。"""
-    create_account("alice")
+    wallet_address = create_account()
 
-    level_result = admin_tools.set_account_level("alice", "max")
-    day_result = admin_tools.set_account_day("alice", 12)
-    account = admin_tools.get_account("alice")
+    level_result = admin_tools.set_account_level(wallet_address, "max")
+    day_result = admin_tools.set_account_day(wallet_address, 12)
+    account = admin_tools.get_account(wallet_address)
 
     assert level_result["accountLevel"] == "max"
     assert day_result["day"] == 12
     assert account == {
-        "accountName": "alice",
-        "publicKey": "0xalice",
+        "walletAddress": wallet_address,
         "accountLevel": "max",
         "day": 12,
         "createdAt": account["createdAt"],
@@ -123,12 +133,12 @@ def test_admin_can_update_account_level_and_day_without_exposing_password_hash()
 
 def test_admin_rejects_invalid_account_level_and_negative_day() -> None:
     """測試後台會拒絕不合法帳號等級與負數 day。"""
-    create_account("alice")
+    wallet_address = create_account()
 
     with pytest.raises(ValueError, match="account level"):
-        admin_tools.set_account_level("alice", "pro")
+        admin_tools.set_account_level(wallet_address, "pro")
     with pytest.raises(ValueError, match="day"):
-        admin_tools.set_account_day("alice", -1)
+        admin_tools.set_account_day(wallet_address, -1)
 
 
 def test_admin_can_list_orders_and_snapshot() -> None:

@@ -257,7 +257,7 @@ def _deadline_expired_reason(payload: dict[str, Any]) -> str | None:
     deadline_sources: list[tuple[str, Any]] = [
         ("intentA.intent.deadline", ((payload.get("intentA") or {}).get("intent") or {}).get("deadline")),
     ]
-    matched_intent_b = ((payload.get("routeDetails") or {}).get("matchedIntentB") or {})
+    matched_intent_b = (payload.get("routeDetails") or {}).get("matchedIntentB")
     if isinstance(matched_intent_b, dict):
         deadline_sources.append(
             (

@@ -227,6 +227,53 @@ def test_grok_agent_decide_calls_grok_and_normalizes_external_request(monkeypatc
     assert decision["externalQuery"]["syncTargets"] == []
 
 
+def test_grok_external_request_backfills_uniswap_target_from_sell_intent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """測試 Grok 漏填 syncTargets 時，後端會用賣單 intent 補 Uniswap V3 target。"""
+    task = make_grok_test_task()
+    task["sellOrder"]["intentJson"] = {
+        "user": "0x1111111111111111111111111111111111111111",
+        "tokenIn": "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14",
+        "tokenOut": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+        "amountIn": "50000000000000",
+        "minAmountOut": "50",
+        "deadline": 1999999999,
+        "salt": "0x" + "11" * 32,
+        "allowPartialFill": True,
+        "chainId": 11155111,
+        "tokenInChainId": 11155111,
+        "tokenOutChainId": 11155111,
+        "fee": 100,
+        "priceLimit": 0,
+        "swapper": "0x1111111111111111111111111111111111111111",
+        "recipient": "0x1111111111111111111111111111111111111111",
+    }
+
+    monkeypatch.setattr(agent_runner.grok_minimal, "load_agent_memory", lambda: "測試記憶")
+    monkeypatch.setattr(
+        agent_runner.grok_minimal,
+        "ask_grok_with_memory",
+        lambda memory, task: """
+        {
+          "decisionStatus": "request_external_contract_data",
+          "reason": "本地沒有候選買單，需查外部合約",
+          "externalQuery": {"syncTargets": []}
+        }
+        """,
+    )
+
+    decision = agent_runner.grok_agent_decide(task, None)
+    targets = decision["externalQuery"]["syncTargets"]
+
+    assert len(targets) == 1
+    assert targets[0]["intentId"] == "sell-order-99-uniswap-v3"
+    assert targets[0]["tokenIn"] == task["sellOrder"]["intentJson"]["tokenIn"]
+    assert targets[0]["tokenOut"] == task["sellOrder"]["intentJson"]["tokenOut"]
+    assert targets[0]["amountIn"] == "50000000000000"
+    assert targets[0]["protocols"] == ["V3"]
+    assert targets[0]["fee"] == 100
+    assert targets[0]["priceLimit"] == 0
+
+
 def test_grok_agent_decide_rejects_invalid_status(monkeypatch: pytest.MonkeyPatch) -> None:
     """測試 Grok 回傳不合法 decisionStatus 時會被擋下。"""
     monkeypatch.setattr(agent_runner.grok_minimal, "load_agent_memory", lambda: "")
