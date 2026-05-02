@@ -3,8 +3,8 @@
 import { useState } from 'react';
 import { useAuth } from '@/hooks/useAuth';
 import { useLanguage } from '@/contexts/LanguageContext';
-import { useWalletClient } from 'wagmi';
-import { approvePriorityFee, payPriorityFee, PLAN_AMOUNTS } from '@/lib/pricing';
+import { useWalletClient, usePublicClient } from 'wagmi';
+import { approvePriorityFee, payPriorityFee, checkAllowance, PLAN_AMOUNTS } from '@/lib/pricing';
 import { api } from '@/lib/api';
 
 const PLAN_KEYS = ['free', 'plus', 'max'] as const;
@@ -20,6 +20,7 @@ export default function PricingPage() {
   const { t } = useLanguage();
   const { address, isAuthenticated } = useAuth();
   const { data: walletClient } = useWalletClient();
+  const publicClient = usePublicClient();
   const [currentLevel, setCurrentLevel] = useState<string>('free');
   const [step, setStep] = useState<'idle' | 'approving' | 'paying' | 'verifying'>('idle');
   const [error, setError] = useState('');
@@ -35,7 +36,7 @@ export default function PricingPage() {
   });
 
   async function handleUpgrade(plan: PlanKey) {
-    if (!walletClient || !address || plan === 'free') return;
+    if (!walletClient || !publicClient || !address || plan === 'free') return;
     const amount = PLAN_AMOUNTS[plan];
     if (!amount) return;
 
@@ -43,9 +44,14 @@ export default function PricingPage() {
     setSuccess('');
 
     try {
-      // Step 1: Approve USDC
-      setStep('approving');
-      await approvePriorityFee({ walletClient, user: address, amountUsdc: amount });
+      const rawAmount = BigInt(amount) * BigInt(10 ** 6);
+      const allowance = await checkAllowance({ publicClient, user: address });
+      
+      if (allowance < rawAmount) {
+        // Step 1: Approve USDC
+        setStep('approving');
+        await approvePriorityFee({ walletClient, user: address, amountUsdc: amount });
+      }
 
       // Step 2: Pay
       setStep('paying');

@@ -1,5 +1,6 @@
 'use client';
 
+import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import Image from 'next/image';
 import { usePathname } from 'next/navigation';
@@ -14,15 +15,43 @@ function WalletButton() {
   const { disconnect } = useDisconnect();
   const { t } = useLanguage();
 
+  const [level, setLevel] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (isConnected && address) {
+      import('@/lib/api').then(({ api }) => {
+        api.get<{ accountLevel: string }>('/account/me')
+           .then(res => setLevel(res.accountLevel))
+           .catch(() => setLevel(null));
+      });
+    } else {
+      setLevel(null);
+    }
+  }, [isConnected, address]);
+
   if (isConnected && address) {
     return (
-      <button
-        onClick={() => disconnect()}
-        className="px-4 py-2 rounded-lg text-sm font-medium transition-colors hover:opacity-80"
-        style={{ background: '#f2a8b4', color: '#1c1c1c' }}
-      >
-        {address.slice(0, 6)}...{address.slice(-4)}
-      </button>
+      <div className="flex items-center gap-2">
+        {level && level !== 'free' && (
+          <span
+            className="px-2 py-1 rounded-md text-xs font-bold uppercase"
+            style={{
+              background: level === 'max' ? '#f9d0d8' : '#fde8ec',
+              color: level === 'max' ? '#c0475a' : '#e07585',
+              border: `1px solid ${level === 'max' ? '#e07585' : '#f2a8b4'}`,
+            }}
+          >
+            {level}
+          </span>
+        )}
+        <button
+          onClick={() => disconnect()}
+          className="px-4 py-2 rounded-lg text-sm font-medium transition-colors hover:opacity-80"
+          style={{ background: '#f2a8b4', color: '#1c1c1c' }}
+        >
+          {address.slice(0, 6)}...{address.slice(-4)}
+        </button>
+      </div>
     );
   }
 

@@ -1,9 +1,8 @@
 'use client';
 
 import { ActiveOrdersTable } from '@/components/dashboard/ActiveOrdersTable';
-import { PriceChart } from '@/components/dashboard/PriceChart';
 import { useLanguage } from '@/contexts/LanguageContext';
-import { useBuyOrders, useSellOrders } from '@/hooks/useOrders';
+import { useBuyOrders, useSellOrders, useExecutions } from '@/hooks/useOrders';
 import { useAuth } from '@/hooks/useAuth';
 import type { AnyOrder, OrderStatus } from '@/types/api';
 
@@ -12,6 +11,7 @@ export default function DashboardPage() {
   const { isAuthenticated } = useAuth();
   const { data: buyOrders = [] } = useBuyOrders();
   const { data: sellOrders = [] } = useSellOrders();
+  const { data: executions = [] } = useExecutions();
 
   // 合併買賣單為 ActiveOrdersTable 可用格式
   const allOrders: AnyOrder[] = [
@@ -27,6 +27,16 @@ export default function DashboardPage() {
     })),
   ].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
+  const getTxHash = (orderId: number, direction: 'BUY' | 'SELL') => {
+    if (direction === 'SELL') {
+      const exec = executions.find(e => e.sellOrderId === orderId);
+      return exec ? exec.executionId : undefined;
+    }
+    // BUY orders currently don't map directly to executionId in the response model easily without an execution list specifically for buy_order, 
+    // but if relatedBy is implemented in the frontend model, we can try to find it. Currently execution model only has sellOrderId.
+    return undefined;
+  };
+
   const tableRows = allOrders.map((o) => ({
     orderId: o.orderId,
     direction: o.direction,
@@ -34,6 +44,7 @@ export default function DashboardPage() {
     amount: o.amount,
     status: o.status as OrderStatus,
     createdAt: o.createdAt,
+    txHash: getTxHash(o.orderId, o.direction),
   }));
 
   return (
@@ -48,8 +59,6 @@ export default function DashboardPage() {
           {t.orderForm.connectFirst}
         </div>
       )}
-
-      <PriceChart data={[]} basePrice={0} />
 
       <ActiveOrdersTable orders={tableRows} />
     </div>
