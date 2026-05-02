@@ -6,6 +6,7 @@ import { useAuth } from '@/hooks/useAuth';
 import { useLanguage } from '@/contexts/LanguageContext';
 import { useWalletClient, usePublicClient } from 'wagmi';
 import { buildSignedIntent, depositToVault } from '@/lib/intent';
+import { getToken } from '@/lib/api';
 
 interface Props {
   onOrderSubmitted: (orderId: number, direction: 'BUY' | 'SELL') => void;
@@ -68,24 +69,28 @@ export function OrderForm({ onOrderSubmitted }: Props) {
       // Step 3: 呼叫後端 API 建立訂單
       setStep('submitting');
       if (tab === 'sell') {
-        const res = await sellMutation.mutateAsync({
+        const payload = {
           asset,
           amount: amt,
           min_unit_price_usdc: price,
           max_splits: splits,
           max_fee_percent: fee,
           ...signedIntent,
-        });
+        };
+        console.debug('Creating SELL order payload:', payload, 'Auth token present:', !!getToken());
+        const res = await sellMutation.mutateAsync(payload);
         onOrderSubmitted(res.sellOrderId, 'SELL');
       } else {
-        const res = await buyMutation.mutateAsync({
+        const payload = {
           asset,
           amount: amt,
           max_unit_price_usdc: price,
           max_splits: splits,
           max_fee_percent: fee,
           ...signedIntent,
-        });
+        };
+        console.debug('Creating BUY order payload:', payload, 'Auth token present:', !!getToken());
+        const res = await buyMutation.mutateAsync(payload);
         onOrderSubmitted(res.buyOrderId, 'BUY');
       }
     } catch (err) {
