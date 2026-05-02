@@ -5,6 +5,7 @@ const SEPOLIA_CHAIN_ID = 11155111;
 const USDC_SEPOLIA = '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238';
 const WETH_SEPOLIA = '0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14';
 const SETTLEMENT_ROUTER_SEPOLIA = '0x98d83435F4aBcE9AdC2C1635125e5f627b7d73E0';
+const INTENT_VAULT_ADDRESS = '0xF1Defe986257b2e8A74f40A48dbe3673268709f4';
 const WETH_DECIMALS = 18;
 const USDC_DECIMALS = 6;
 const DEFAULT_UNISWAP_V3_FEE = 100;
@@ -42,6 +43,41 @@ const intentTypes = {
     { name: 'allowPartialFill', type: 'bool' },
   ],
 } as const;
+
+// ERC20 approve ABI
+const ERC20_ABI = [
+  {
+    name: 'approve',
+    type: 'function',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'spender', type: 'address' },
+      { name: 'amount', type: 'uint256' },
+    ],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+] as const;
+
+// IntentVault deposit ABI
+const INTENT_VAULT_ABI = [
+  {
+    name: 'deposit',
+    type: 'function',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'token', type: 'address' },
+      { name: 'amount', type: 'uint256' },
+    ],
+    outputs: [],
+  },
+  {
+    name: 'depositETH',
+    type: 'function',
+    stateMutability: 'payable',
+    inputs: [],
+    outputs: [],
+  },
+] as const;
 
 // 建立前端送給後端的鏈上 intent，並請錢包用 EIP-712 簽名。
 export async function buildSignedIntent({
@@ -109,6 +145,74 @@ export async function buildSignedIntent({
     signature: normalizeHexSignature(signature),
   };
 }
+
+/**
+ * 授權 token 並存入 IntentVault。
+ * 賣單 (tokenIn=WETH)：可選 depositETH (直接 ETH) 或 deposit (已有 WETH)
+ * 買單 (tokenIn=USDC)：approve → deposit
+ *
+ * @param useETH 若 true 且 side=sell，使用 depositETH 直接存入 ETH
+ */
+export async function depositToVault({
+  walletClient,
+  user,
+  side,
+  amount,
+  unitPriceUsdc,
+  useETH = true,
+}: {
+  walletClient: WalletClient;
+  user: `0x${string}`;
+  side: OrderSide;
+  amount: number;
+  unitPriceUsdc: number;
+  useETH?: boolean;
+}): Promise<void> {
+  const amountIn = side === 'sell'
+    ? toTokenUnits(amount, WETH_DECIMALS)
+    : toTokenUnits(amount * unitPriceUsdc, USDC_DECIMALS);
+  const tokenIn = side === 'sell' ? WETH_SEPOLIA : USDC_SEPOLIA;
+
+  if (side === 'sell' && useETH) {
+    // 直接用 ETH 存入，合約會自動 wrap 為 WETH
+    await walletClient.writeContract({
+      address: INTENT_VAULT_ADDRESS as `0x${string}`,
+      abi: INTENT_VAULT_ABI,
+      functionName: 'depositETH',
+      args: [],
+      value: amountIn,
+      account: user,
+      chain: { id: SEPOLIA_CHAIN_ID } as any,
+    });
+  } else {
+    // ERC20: approve → deposit
+    await walletClient.writeContract({
+      address: tokenIn as `0x${string}`,
+      abi: ERC20_ABI,
+      functionName: 'approve',
+      args: [INTENT_VAULT_ADDRESS as `0x${string}`, amountIn],
+      account: user,
+      chain: { id: SEPOLIA_CHAIN_ID } as any,
+    });
+    await walletClient.writeContract({
+      address: INTENT_VAULT_ADDRESS as `0x${string}`,
+      abi: INTENT_VAULT_ABI,
+      functionName: 'deposit',
+      args: [tokenIn as `0x${string}`, amountIn],
+      account: user,
+      chain: { id: SEPOLIA_CHAIN_ID } as any,
+    });
+  }
+}
+
+// Contract addresses export for reuse
+export const CONTRACTS = {
+  INTENT_VAULT: INTENT_VAULT_ADDRESS,
+  SETTLEMENT_ROUTER: SETTLEMENT_ROUTER_SEPOLIA,
+  WETH: WETH_SEPOLIA,
+  USDC: USDC_SEPOLIA,
+  CHAIN_ID: SEPOLIA_CHAIN_ID,
+} as const;
 
 // 確保送進後端的 signature 永遠符合 0x-prefixed hex 格式。
 function normalizeHexSignature(signature: string): string {

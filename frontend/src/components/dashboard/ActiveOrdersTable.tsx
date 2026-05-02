@@ -16,10 +16,13 @@ interface Props {
   orders: OrderRow[];
 }
 
-const STATUS_COLORS: Record<OrderStatus, { bg: string; color: string }> = {
+const STATUS_COLORS: Record<string, { bg: string; color: string }> = {
   pending: { bg: '#fef3c7', color: '#92400e' },
   confirmed: { bg: '#dcfce7', color: '#166534' },
+  filled: { bg: '#dcfce7', color: '#166534' },
   failed: { bg: '#fee2e2', color: '#991b1b' },
+  invalid: { bg: '#fee2e2', color: '#991b1b' },
+  timeout: { bg: '#fef3c7', color: '#92400e' },
 };
 
 export function ActiveOrdersTable({ orders }: Props) {
@@ -27,10 +30,13 @@ export function ActiveOrdersTable({ orders }: Props) {
 
   const cols = ['Order ID', t.ordersTable.colDirection, t.ordersTable.colAsset, t.ordersTable.colAmount, t.ordersTable.colStatus, t.ordersTable.colTime];
 
-  const statusLabel: Record<OrderStatus, string> = {
+  const statusLabel: Record<string, string> = {
     pending: t.ordersTable.statusPending,
     confirmed: t.ordersTable.statusConfirmed,
+    filled: t.ordersTable.statusConfirmed,
     failed: t.ordersTable.statusFailed,
+    invalid: t.ordersTable.statusFailed,
+    timeout: 'Timeout',
   };
 
   return (
@@ -62,7 +68,7 @@ export function ActiveOrdersTable({ orders }: Props) {
           </thead>
           <tbody>
             {orders.map((o) => {
-              const colors = STATUS_COLORS[o.status];
+              const colors = STATUS_COLORS[o.status] || { bg: '#f3f4f6', color: '#374151' };
               return (
                 <tr key={o.orderId} className="border-t" style={{ borderColor: '#f5f0eb' }}>
                   <td className="px-5 py-3 font-mono text-xs" style={{ color: '#888' }}>#{o.orderId}</td>
@@ -84,7 +90,7 @@ export function ActiveOrdersTable({ orders }: Props) {
                       className="px-2 py-0.5 rounded-full text-xs font-semibold"
                       style={{ background: colors.bg, color: colors.color }}
                     >
-                      {statusLabel[o.status]}
+                      {statusLabel[o.status] || o.status}
                     </span>
                   </td>
                   <td className="px-5 py-3 text-xs" style={{ color: '#aaa' }}>

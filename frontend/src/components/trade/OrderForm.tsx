@@ -3,25 +3,15 @@
 import { useState } from 'react';
 import { useBuyOrder, useSellOrder } from '@/hooks/useOrders';
 import { useAuth } from '@/hooks/useAuth';
-import { SlippageWarning } from './SlippageWarning';
 import { useLanguage } from '@/contexts/LanguageContext';
 import { useWalletClient } from 'wagmi';
-import { buildSignedIntent } from '@/lib/intent';
+import { buildSignedIntent, depositToVault } from '@/lib/intent';
 
 interface Props {
-  onOrderSubmitted: (slippage: number, splits: number, chunkSize: number) => void;
+  onOrderSubmitted: (orderId: number, direction: 'BUY' | 'SELL') => void;
 }
 
 const ASSETS = ['WETH'];
-
-// 模擬滑價計算：amount 越大，滑價越高
-function estimateSlippage(amount: number): number {
-  if (amount <= 5) return 0.3;
-  if (amount <= 20) return 1.2;
-  if (amount <= 50) return 2.8;
-  if (amount <= 100) return 4.8;
-  return Math.min(amount * 0.048, 15);
-}
 
 export function OrderForm({ onOrderSubmitted }: Props) {
   const { address, isAuthenticated } = useAuth();
@@ -33,39 +23,27 @@ export function OrderForm({ onOrderSubmitted }: Props) {
   const [unitPrice, setUnitPrice] = useState('');
   const [maxSplits, setMaxSplits] = useState('10');
   const [maxFee, setMaxFee] = useState('0.3');
-  const [slippage, setSlippage] = useState(0);
-  const [estimated, setEstimated] = useState(false);
   const [submitError, setSubmitError] = useState('');
+  const [step, setStep] = useState<'idle' | 'signing' | 'depositing' | 'submitting'>('idle');
 
   const buyMutation = useBuyOrder();
   const sellMutation = useSellOrder();
-  const isPending = buyMutation.isPending || sellMutation.isPending;
-
-  function handleEstimate() {
-    const amt = parseFloat(amount);
-    if (!amt || amt <= 0) return;
-    const s = estimateSlippage(amt);
-    setSlippage(s);
-    setEstimated(true);
-  }
+  const isPending = step !== 'idle';
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!isAuthenticated) return;
+    if (!isAuthenticated || !address || !walletClient) return;
     const amt = parseFloat(amount);
     const price = parseFloat(unitPrice);
     const splits = parseInt(maxSplits);
     const fee = parseFloat(maxFee);
     if (!amt || !price) return;
 
-    const sl = estimated ? slippage : estimateSlippage(amt);
-    setSlippage(sl);
-
-    const chunkSize = Math.ceil(amt / splits);
-
     try {
       setSubmitError('');
-      if (!address) return;
+
+      // Step 1: 簽署 EIP-712
+      setStep('signing');
       const signedIntent = await buildSignedIntent({
         side: tab,
         user: address,
@@ -73,8 +51,22 @@ export function OrderForm({ onOrderSubmitted }: Props) {
         amount: amt,
         unitPriceUsdc: price,
       });
+
+      // Step 2: 授權 + 存入 IntentVault
+      setStep('depositing');
+      await depositToVault({
+        walletClient,
+        user: address,
+        side: tab,
+        amount: amt,
+        unitPriceUsdc: price,
+        useETH: tab === 'sell',
+      });
+
+      // Step 3: 呼叫後端 API 建立訂單
+      setStep('submitting');
       if (tab === 'sell') {
-        await sellMutation.mutateAsync({
+        const res = await sellMutation.mutateAsync({
           asset,
           amount: amt,
           min_unit_price_usdc: price,
@@ -82,8 +74,9 @@ export function OrderForm({ onOrderSubmitted }: Props) {
           max_fee_percent: fee,
           ...signedIntent,
         });
+        onOrderSubmitted(res.sellOrderId, 'SELL');
       } else {
-        await buyMutation.mutateAsync({
+        const res = await buyMutation.mutateAsync({
           asset,
           amount: amt,
           max_unit_price_usdc: price,
@@ -91,12 +84,20 @@ export function OrderForm({ onOrderSubmitted }: Props) {
           max_fee_percent: fee,
           ...signedIntent,
         });
+        onOrderSubmitted(res.buyOrderId, 'BUY');
       }
-      onOrderSubmitted(sl, splits, chunkSize);
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : '送出訂單失敗');
+    } finally {
+      setStep('idle');
     }
   }
+
+  const stepLabels: Record<string, string> = {
+    signing: t.orderForm.stepSigning ?? '簽署中...',
+    depositing: t.orderForm.stepDepositing ?? '存入 Vault 中...',
+    submitting: t.orderForm.submitting,
+  };
 
   const error = submitError || buyMutation.error?.message || sellMutation.error?.message;
 
@@ -149,7 +150,7 @@ export function OrderForm({ onOrderSubmitted }: Props) {
             min="0.001"
             step="any"
             value={amount}
-            onChange={(e) => { setAmount(e.target.value); setEstimated(false); setSlippage(0); }}
+            onChange={(e) => setAmount(e.target.value)}
             placeholder={t.orderForm.amountPlaceholder}
             required
             className="w-full px-3 py-2.5 rounded-xl text-sm outline-none"
@@ -203,20 +204,6 @@ export function OrderForm({ onOrderSubmitted }: Props) {
           </div>
         </div>
 
-        {/* Estimate slippage */}
-        <button
-          type="button"
-          onClick={handleEstimate}
-          disabled={!amount}
-          className="text-sm py-2 rounded-xl font-medium transition-all hover:opacity-80"
-          style={{ background: '#fde8ec', color: '#e07585', border: '1px solid #f2a8b4' }}
-        >
-          {t.orderForm.estimateSlippage}
-        </button>
-
-        {/* Slippage warning */}
-        {slippage > 0 && <SlippageWarning slippage={slippage} />}
-
         {error && (
           <div className="text-xs px-3 py-2 rounded-lg" style={{ background: '#fee2e2', color: '#991b1b' }}>
             {error}
@@ -232,7 +219,7 @@ export function OrderForm({ onOrderSubmitted }: Props) {
           {!isAuthenticated
             ? t.orderForm.connectFirst
             : isPending
-            ? t.orderForm.submitting
+            ? (stepLabels[step] || t.orderForm.submitting)
             : tab === 'sell' ? t.orderForm.submitSell : t.orderForm.submitBuy}
         </button>
       </form>

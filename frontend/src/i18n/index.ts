@@ -5,6 +5,7 @@ const zh = {
     home: '首頁',
     trade: '交易',
     dashboard: '儀表板',
+    pricing: '訂閱方案',
     connectWallet: '連接錢包',
   },
   landing: {
@@ -49,27 +50,17 @@ const zh = {
     labelMaxFee: '最大手續費 (%)',
     amountPlaceholder: '例：1000',
     pricePlaceholder: '例：3000',
-    estimateSlippage: '預估滑價',
     connectFirst: '請先連接錢包',
     submitting: '送出中...',
     submitSell: '提交賣單',
     submitBuy: '提交買單',
-  },
-  slippage: {
-    highRisk: '[高風險]',
-    warning: '[警告]',
-    slippageMsg: (pct: string) => `滑價警告：直接執行將導致 ${pct}% 滑價`,
-    protection: '本系統將啟動 TWAP 拆單防護，自動分批執行以保護您的成交價。',
+    stepSigning: '簽署 EIP-712 中...',
+    stepDepositing: '存入 Vault 中...',
   },
   agentTerminal: {
     running: '● 執行中',
     waiting: '> 等待訂單提交...',
     waitingDesc: '> 送出訂單後，Agent 日誌將在此即時顯示。',
-  },
-  progressCard: {
-    chunkDone: (current: number, total: number) => `第 ${current}/${total} 筆完成`,
-    saved: '節省',
-    makerProfit: '做市商獲利',
   },
   dashboard: {
     title: '儀表板',
@@ -101,20 +92,17 @@ const zh = {
     tooltipPrice: '成交價',
     baseline: '基準價',
   },
-  agentLogs: {
-    build: (slippage: number, splits: number, chunkSize: number) => {
-      const savings = (slippage * chunkSize * 3000 * splits * 0.01).toFixed(0);
-      const makerProfit = (chunkSize * 3000 * 0.003).toFixed(2);
-      return [
-        `Agent A: 正在解析意圖... 呼叫 Uniswap API 獲取報價。`,
-        `Agent A: 警告！直接執行將導致 ${slippage.toFixed(1)}% 滑價。啟動防護協議，拆分為 ${splits} 筆 x ${chunkSize} WETH。`,
-        `Agent A: 向 UniDarkpool 廣播 ${chunkSize} WETH 賣單意圖。`,
-        `Agent B: 攔截到意圖。在暗池中尋找對手方...`,
-        `Agent B: 找到對手方，OTC 撮合成功，成交價優於市場。`,
-        `Agent A: 執行 Tx [Swap ${chunkSize} WETH]... 成功 (滑價 0.00%)。`,
-        `Dashboard: 第 1/${splits} 筆交易完成。目前節省 $${savings} USDC 滑價損失。做市商獲利 $${makerProfit} USDC。`,
-      ];
-    },
+  pricing: {
+    title: '訂閱方案',
+    desc: '升級您的帳號以獲得優先撮合與國庫流動性支援。',
+    free: { name: 'Free', price: '$0', features: ['基本訂單功能', '標準撮合佇列'] },
+    plus: { name: 'Plus', price: '$20 USDC/月', features: ['優先撮合訂單的權利', '使用國庫為您的訂單提供流動性', '優先客服支援'] },
+    max: { name: 'Max', price: '$60 USDC/月', features: ['最高優先撮合訂單的權利', '使用國庫為您的訂單提供流動性', 'VIP 專屬支援', '最大拆單數提升'] },
+    current: '當前方案',
+    upgrade: '升級',
+    approving: '授權中...',
+    paying: '付款中...',
+    verifying: '驗證中...',
   },
 };
 
@@ -123,6 +111,7 @@ const en = {
     home: 'Home',
     trade: 'Trade',
     dashboard: 'Dashboard',
+    pricing: 'Pricing',
     connectWallet: 'Connect Wallet',
   },
   landing: {
@@ -167,27 +156,17 @@ const en = {
     labelMaxFee: 'Max Fee (%)',
     amountPlaceholder: 'e.g. 1000',
     pricePlaceholder: 'e.g. 3000',
-    estimateSlippage: 'Estimate Slippage',
     connectFirst: 'Connect wallet first',
     submitting: 'Submitting...',
     submitSell: 'Submit Sell Order',
     submitBuy: 'Submit Buy Order',
-  },
-  slippage: {
-    highRisk: '[HIGH RISK]',
-    warning: '[WARNING]',
-    slippageMsg: (pct: string) => `Slippage Alert: Direct execution would cause ${pct}% slippage`,
-    protection: 'TWAP splitting protection will be activated to execute in batches and protect your fill price.',
+    stepSigning: 'Signing EIP-712...',
+    stepDepositing: 'Depositing to Vault...',
   },
   agentTerminal: {
     running: '● Running',
     waiting: '> Waiting for order submission...',
     waitingDesc: '> Agent logs will appear here in real time after you submit an order.',
-  },
-  progressCard: {
-    chunkDone: (current: number, total: number) => `Chunk ${current}/${total} done`,
-    saved: 'Saved',
-    makerProfit: 'Maker profit',
   },
   dashboard: {
     title: 'Dashboard',
@@ -219,20 +198,17 @@ const en = {
     tooltipPrice: 'Fill Price',
     baseline: 'Base Price',
   },
-  agentLogs: {
-    build: (slippage: number, splits: number, chunkSize: number) => {
-      const savings = (slippage * chunkSize * 3000 * splits * 0.01).toFixed(0);
-      const makerProfit = (chunkSize * 3000 * 0.003).toFixed(2);
-      return [
-        `Agent A: Parsing intent... Calling Uniswap API to fetch quotes.`,
-        `Agent A: WARNING! Direct execution would cause ${slippage.toFixed(1)}% slippage. Activating protection — splitting into ${splits} chunks x ${chunkSize} WETH.`,
-        `Agent A: Broadcasting ${chunkSize} WETH sell intent to UniDarkpool.`,
-        `Agent B: Intent intercepted. Searching for counterparty in dark pool...`,
-        `Agent B: Counterparty found. OTC match successful, fill price beats market.`,
-        `Agent A: Executing Tx [Swap ${chunkSize} WETH]... Success (slippage 0.00%).`,
-        `Dashboard: Chunk 1/${splits} complete. Saved $${savings} USDC slippage. Maker profit $${makerProfit} USDC.`,
-      ];
-    },
+  pricing: {
+    title: 'Pricing Plans',
+    desc: 'Upgrade your account for priority matching and treasury liquidity support.',
+    free: { name: 'Free', price: '$0', features: ['Basic order functionality', 'Standard matching queue'] },
+    plus: { name: 'Plus', price: '$20 USDC/mo', features: ['Priority order matching', 'Treasury liquidity support for your orders', 'Priority customer support'] },
+    max: { name: 'Max', price: '$60 USDC/mo', features: ['Highest priority order matching', 'Treasury liquidity support for your orders', 'VIP dedicated support', 'Increased max splits'] },
+    current: 'Current Plan',
+    upgrade: 'Upgrade',
+    approving: 'Approving...',
+    paying: 'Paying...',
+    verifying: 'Verifying...',
   },
 };
 

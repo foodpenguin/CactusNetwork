@@ -1,6 +1,5 @@
 'use client';
 
-import { useState } from 'react';
 import { OrderForm } from '@/components/trade/OrderForm';
 import { AgentTerminal } from '@/components/trade/AgentTerminal';
 import { useAgentLog } from '@/hooks/useAgentLog';
@@ -9,13 +8,9 @@ import { useLanguage } from '@/contexts/LanguageContext';
 export default function TradePage() {
   const { t } = useLanguage();
   const { logs, running, start } = useAgentLog();
-  const [progress, setProgress] = useState({ current: 0, total: 0, savedUsdc: 0, makerProfit: 0 });
 
-  function handleOrderSubmitted(slippage: number, splits: number, chunkSize: number) {
-    start(slippage, splits, chunkSize);
-    const savedUsdc = Math.round(slippage * chunkSize * 3000 * splits * 0.01);
-    const makerProfit = chunkSize * 3000 * 0.003 * splits;
-    setProgress({ current: 1, total: splits, savedUsdc, makerProfit });
+  function handleOrderSubmitted(orderId: number, direction: 'BUY' | 'SELL') {
+    start(orderId, direction);
   }
 
   return (
@@ -35,7 +30,7 @@ export default function TradePage() {
 
         {/* Agent Terminal — 3/5 */}
         <div className="lg:col-span-3">
-          <AgentTerminal logs={logs} running={running} progress={progress} />
+          <AgentTerminal logs={logs} running={running} />
         </div>
       </div>
     </div>

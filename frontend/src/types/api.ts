@@ -1,9 +1,7 @@
 // ── Auth ──────────────────────────────────────────────
 
-export interface AccountResponse {
-  message: string;
-  accountName: string;
-  publicKey: string;
+export interface AccountInfoResponse {
+  walletAddress: string;
   accountLevel: string;
   day: number;
   createdAt: string;
@@ -14,6 +12,8 @@ export interface LoginResponse {
   tokenType: 'Bearer';
   accessToken: string;
   expiresAt: string;
+  walletAddress: string;
+  accountLevel: string;
 }
 
 // ── Orders ────────────────────────────────────────────
@@ -119,3 +119,19 @@ export type AnyOrder = (BuyOrderResponse | SellOrderResponse) & {
   direction: 'BUY' | 'SELL';
   orderId: number;
 };
+
+// ── Pricing ──────────────────────────────────────────
+
+export interface UpgradeRequest {
+  tx_hash: string;
+  target_level: 'plus' | 'max';
+}
+
+export interface UpgradeResponse {
+  message: string;
+  txHash: string;
+  walletAddress: string;
+  accountLevel: string;
+  day: number;
+  createdAt: string;
+}
