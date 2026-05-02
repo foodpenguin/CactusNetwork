@@ -153,6 +153,7 @@ pnpm run dev     # starts on http://localhost:3000
   - Email: t112AB0004@ntut.org.tw
 
 ## Demo link
-
+ - **website**: <http://34.81.58.100/> ( It may become unusable after one month. )
+ - **video**: <https://youtu.be/_wXlfvcaBfs>
 ## License
 MIT
