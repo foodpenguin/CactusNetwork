@@ -1,10 +1,10 @@
-import type { WalletClient } from 'viem';
+import type { WalletClient, PublicClient } from 'viem';
 import { CONTRACTS } from './intent';
 
 const PRIORITY_FEE_ADDRESS = '0xbF57d7f6d829A647F880BBE18bbEF8e66DC15C61';
 const USDC_DECIMALS = 6;
 
-const ERC20_APPROVE_ABI = [
+const ERC20_ABI = [
   {
     name: 'approve',
     type: 'function',
@@ -14,6 +14,16 @@ const ERC20_APPROVE_ABI = [
       { name: 'amount', type: 'uint256' },
     ],
     outputs: [{ name: '', type: 'bool' }],
+  },
+  {
+    name: 'allowance',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'owner', type: 'address' },
+      { name: 'spender', type: 'address' },
+    ],
+    outputs: [{ name: '', type: 'uint256' }],
   },
 ] as const;
 
@@ -36,6 +46,24 @@ export const PLAN_AMOUNTS: Record<string, number> = {
 };
 
 /**
+ * 檢查 USDC 授權額度。
+ */
+export async function checkAllowance({
+  publicClient,
+  user,
+}: {
+  publicClient: PublicClient;
+  user: `0x${string}`;
+}): Promise<bigint> {
+  return await publicClient.readContract({
+    address: CONTRACTS.USDC as `0x${string}`,
+    abi: ERC20_ABI,
+    functionName: 'allowance',
+    args: [user, PRIORITY_FEE_ADDRESS as `0x${string}`],
+  });
+}
+
+/**
  * 授權 USDC 給 PriorityFee 合約。
  */
 export async function approvePriorityFee({
@@ -50,7 +78,7 @@ export async function approvePriorityFee({
   const rawAmount = BigInt(amountUsdc) * BigInt(10 ** USDC_DECIMALS);
   const hash = await walletClient.writeContract({
     address: CONTRACTS.USDC as `0x${string}`,
-    abi: ERC20_APPROVE_ABI,
+    abi: ERC20_ABI,
     functionName: 'approve',
     args: [PRIORITY_FEE_ADDRESS as `0x${string}`, rawAmount],
     account: user,

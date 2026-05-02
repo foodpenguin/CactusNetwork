@@ -10,6 +10,7 @@ interface OrderRow {
   amount: number;
   status: OrderStatus;
   createdAt: string;
+  txHash?: string;
 }
 
 interface Props {
@@ -28,7 +29,7 @@ const STATUS_COLORS: Record<string, { bg: string; color: string }> = {
 export function ActiveOrdersTable({ orders }: Props) {
   const { t } = useLanguage();
 
-  const cols = ['Order ID', t.ordersTable.colDirection, t.ordersTable.colAsset, t.ordersTable.colAmount, t.ordersTable.colStatus, t.ordersTable.colTime];
+  const cols = ['Order ID', t.ordersTable.colDirection, t.ordersTable.colAsset, t.ordersTable.colAmount, t.ordersTable.colStatus, t.ordersTable.colTime, 'Tx'];
 
   const statusLabel: Record<string, string> = {
     pending: t.ordersTable.statusPending,
@@ -95,6 +96,21 @@ export function ActiveOrdersTable({ orders }: Props) {
                   </td>
                   <td className="px-5 py-3 text-xs" style={{ color: '#aaa' }}>
                     {new Date(o.createdAt).toLocaleString(t.ordersTable.localeTime)}
+                  </td>
+                  <td className="px-5 py-3 text-xs">
+                    {o.txHash ? (
+                      <a
+                        href={`https://sepolia.etherscan.io/tx/${o.txHash}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="underline hover:opacity-80 transition-opacity"
+                        style={{ color: '#e07585' }}
+                      >
+                        Etherscan
+                      </a>
+                    ) : (
+                      <span style={{ color: '#ccc' }}>-</span>
+                    )}
                   </td>
                 </tr>
               );
