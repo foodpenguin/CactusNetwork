@@ -1,33 +1,23 @@
 import { api, setToken } from './api';
-import type { AccountResponse, LoginResponse } from '@/types/api';
+import type { LoginResponse } from '@/types/api';
 
-export async function registerOrLogin(address: string): Promise<string> {
-  const accountName = `${address.slice(0, 6)}...${address.slice(-4)}`;
-  const password = address;
-  const publicKey = address;
-
-  // 先嘗試登入
-  try {
-    const loginRes = await api.post<LoginResponse>('/login', {
-      account_name: accountName,
-      password,
-    });
-    setToken(loginRes.accessToken);
-    return loginRes.accessToken;
-  } catch {
-    // 登入失敗表示帳號不存在，先建立帳號
-  }
-
-  await api.post<AccountResponse>('/accounts', {
-    account_name: accountName,
-    password,
-    public_key: publicKey,
-  });
-
+/**
+ * 錢包簽名登入流程：
+ * 1. GET /auth/nonce 取得 nonce
+ * 2. 使用者錢包對 nonce 做 personal_sign
+ * 3. POST /login 送 address + signature
+ * 4. 後端驗證後核發 Bearer token（帳號不存在時自動建立）
+ */
+export async function walletLogin(
+  address: string,
+  signMessage: (args: { message: string }) => Promise<string>,
+): Promise<LoginResponse> {
+  const nonceRes = await api.get<{ nonce: string }>(`/auth/nonce?address=${address}`);
+  const signature = await signMessage({ message: nonceRes.nonce });
   const loginRes = await api.post<LoginResponse>('/login', {
-    account_name: accountName,
-    password,
+    address,
+    signature,
   });
   setToken(loginRes.accessToken);
-  return loginRes.accessToken;
+  return loginRes;
 }

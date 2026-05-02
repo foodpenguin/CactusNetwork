@@ -13,12 +13,12 @@ from scripts import orchestrator_server
 VALID_ACCOUNT_LEVELS = {"free", "plus", "max", "admin"}
 
 
-def set_account_level(account_name: str, level: str) -> dict[str, Any]:
+def set_account_level(wallet_address: str, level: str) -> dict[str, Any]:
     """
     後台調整帳號等級。
 
     輸入：
-    - `account_name`：要調整的帳號名稱。
+    - `wallet_address`：要調整的錢包地址。
     - `level`：新的帳號等級，只能是 `free`、`plus`、`max`、`admin`。
 
     輸出：
@@ -35,21 +35,21 @@ def set_account_level(account_name: str, level: str) -> dict[str, Any]:
     api_server._init_databases()
     with sqlite3.connect(api_server.ACCOUNTS_DB) as conn:
         cursor = conn.execute(
-            "UPDATE accounts SET account_level = ? WHERE account_name = ?",
-            (normalized_level, account_name),
+            "UPDATE accounts SET account_level = ? WHERE wallet_address = ?",
+            (normalized_level, wallet_address.lower()),
         )
         conn.commit()
     if cursor.rowcount != 1:
-        raise ValueError(f"account_name={account_name} 不存在")
-    return get_account(account_name)
+        raise ValueError(f"wallet_address={wallet_address} 不存在")
+    return get_account(wallet_address)
 
 
-def set_account_day(account_name: str, day: int) -> dict[str, Any]:
+def set_account_day(wallet_address: str, day: int) -> dict[str, Any]:
     """
     後台調整帳號 day 欄位。
 
     輸入：
-    - `account_name`：要調整的帳號名稱。
+    - `wallet_address`：要調整的錢包地址。
     - `day`：新的 day 數值，必須大於等於 0。
 
     輸出：
@@ -65,38 +65,38 @@ def set_account_day(account_name: str, day: int) -> dict[str, Any]:
     api_server._init_databases()
     with sqlite3.connect(api_server.ACCOUNTS_DB) as conn:
         cursor = conn.execute(
-            "UPDATE accounts SET day = ? WHERE account_name = ?",
-            (normalized_day, account_name),
+            "UPDATE accounts SET day = ? WHERE wallet_address = ?",
+            (normalized_day, wallet_address.lower()),
         )
         conn.commit()
     if cursor.rowcount != 1:
-        raise ValueError(f"account_name={account_name} 不存在")
-    return get_account(account_name)
+        raise ValueError(f"wallet_address={wallet_address} 不存在")
+    return get_account(wallet_address)
 
 
-def get_account(account_name: str) -> dict[str, Any]:
+def get_account(wallet_address: str) -> dict[str, Any]:
     """
     讀取單一帳號公開資訊。
 
     輸入：
-    - `account_name`：帳號名稱。
+    - `wallet_address`：錢包地址。
 
     輸出：
-    - 回傳帳號資訊，不包含 `password_hash` 與 `salt`。
+    - 回傳帳號資訊。
     """
     api_server._init_databases()
     with sqlite3.connect(api_server.ACCOUNTS_DB) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             """
-            SELECT account_name, public_key, account_level, day, created_at
+            SELECT wallet_address, account_level, day, created_at
             FROM accounts
-            WHERE account_name = ?
+            WHERE wallet_address = ?
             """,
-            (account_name,),
+            (wallet_address.lower(),),
         ).fetchone()
     if row is None:
-        raise ValueError(f"account_name={account_name} 不存在")
+        raise ValueError(f"wallet_address={wallet_address} 不存在")
     return _account_row_to_dict(row)
 
 
@@ -108,7 +108,7 @@ def list_accounts(level: str | None = None) -> list[dict[str, Any]]:
     - `level`：可選帳號等級篩選。
 
     輸出：
-    - 回傳帳號資訊 list，不包含 `password_hash` 與 `salt`。
+    - 回傳帳號資訊 list。
     """
     api_server._init_databases()
     params: list[Any] = []
@@ -123,10 +123,10 @@ def list_accounts(level: str | None = None) -> list[dict[str, Any]]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             f"""
-            SELECT account_name, public_key, account_level, day, created_at
+            SELECT wallet_address, account_level, day, created_at
             FROM accounts
             {where_sql}
-            ORDER BY created_at ASC, account_name ASC
+            ORDER BY created_at ASC, wallet_address ASC
             """,
             params,
         ).fetchall()
@@ -262,17 +262,17 @@ def run_cli() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     account_parser = subparsers.add_parser("account")
-    account_parser.add_argument("account_name")
+    account_parser.add_argument("wallet_address")
 
     accounts_parser = subparsers.add_parser("accounts")
     accounts_parser.add_argument("--level")
 
     set_level_parser = subparsers.add_parser("set-level")
-    set_level_parser.add_argument("account_name")
+    set_level_parser.add_argument("wallet_address")
     set_level_parser.add_argument("level")
 
     set_day_parser = subparsers.add_parser("set-day")
-    set_day_parser.add_argument("account_name")
+    set_day_parser.add_argument("wallet_address")
     set_day_parser.add_argument("day", type=int)
 
     orders_parser = subparsers.add_parser("orders")
@@ -291,13 +291,13 @@ def run_cli() -> None:
 
     args = parser.parse_args()
     if args.command == "account":
-        result = get_account(args.account_name)
+        result = get_account(args.wallet_address)
     elif args.command == "accounts":
         result = list_accounts(level=args.level)
     elif args.command == "set-level":
-        result = set_account_level(args.account_name, args.level)
+        result = set_account_level(args.wallet_address, args.level)
     elif args.command == "set-day":
-        result = set_account_day(args.account_name, args.day)
+        result = set_account_day(args.wallet_address, args.day)
     elif args.command == "orders":
         result = list_orders(account_name=args.account_name, status=args.status, limit=args.limit)
     elif args.command == "snapshot":
@@ -347,8 +347,7 @@ def _account_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     - 回傳不含密碼 hash/salt 的帳號資訊。
     """
     return {
-        "accountName": row["account_name"],
-        "publicKey": row["public_key"],
+        "walletAddress": row["wallet_address"],
         "accountLevel": row["account_level"],
         "day": row["day"],
         "createdAt": row["created_at"],

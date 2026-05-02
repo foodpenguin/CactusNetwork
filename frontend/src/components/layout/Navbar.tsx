@@ -45,6 +45,7 @@ export function Navbar() {
     { href: '/', label: t.navbar.home },
     { href: '/trade', label: t.navbar.trade },
     { href: '/dashboard', label: t.navbar.dashboard },
+    { href: '/pricing', label: t.navbar.pricing },
   ];
 
   return (

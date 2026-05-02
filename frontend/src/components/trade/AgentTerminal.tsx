@@ -1,17 +1,19 @@
 'use client';
 
 import { useEffect, useRef } from 'react';
-import type { LogLine } from '@/hooks/useAgentLog';
-import { OrderProgressCard } from './OrderProgressCard';
 import { useLanguage } from '@/contexts/LanguageContext';
+
+export interface LogLine {
+  timestamp: string;
+  text: string;
+}
 
 interface Props {
   logs: LogLine[];
   running: boolean;
-  progress: { current: number; total: number; savedUsdc: number; makerProfit: number };
 }
 
-export function AgentTerminal({ logs, running, progress }: Props) {
+export function AgentTerminal({ logs, running }: Props) {
   const { t } = useLanguage();
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -43,15 +45,12 @@ export function AgentTerminal({ logs, running, progress }: Props) {
           </div>
         ) : (
           logs.map((log, i) => {
-            const isAgentA = log.text.startsWith('Agent A');
-            const isAgentB = log.text.startsWith('Agent B');
-            const isKeeper = log.text.startsWith('KeeperHub');
-            const isDash = log.text.startsWith('Dashboard');
+            const isSystem = log.text.startsWith('[System]') || log.text.startsWith('[系統]');
+            const isStatus = log.text.includes('pending') || log.text.includes('confirmed') || log.text.includes('failed');
             let color = '#f2a8b4';
-            if (isAgentA) color = '#7dd3fc';
-            if (isAgentB) color = '#86efac';
-            if (isKeeper) color = '#fcd34d';
-            if (isDash) color = '#c4b5fd';
+            if (isSystem) color = '#7dd3fc';
+            if (isStatus && log.text.includes('confirmed')) color = '#86efac';
+            if (isStatus && log.text.includes('failed')) color = '#fca5a5';
 
             return (
               <div key={i} className="leading-relaxed">
@@ -63,13 +62,6 @@ export function AgentTerminal({ logs, running, progress }: Props) {
         )}
         <div ref={bottomRef} />
       </div>
-
-      {/* Progress card */}
-      {progress.total > 0 && (
-        <div className="px-4 pb-4">
-          <OrderProgressCard {...progress} />
-        </div>
-      )}
     </div>
   );
 }
