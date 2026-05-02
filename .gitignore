@@ -20,6 +20,16 @@ backend/CactusNetwork_Project_Plan.md
 
 # Local AI-agent context files
 frontend/FRONTEND_AI_CONTEXT.md
+backend/CactusNetwork_AI_Agent_決策流程.md
+backend/CactusNetwork_鏈上狀態同步與讀取技術指南.md
+backend/CactusNetwork_API_Interface_Guide.md
+backend/CactusNetwork_Full_Flow_Test_Guide.md
+CactusNetwork_AI_Agent_決策流程.md
+CactusNetwork_鏈上狀態同步與讀取技術指南.md
+CactusNetwork_API_Interface_Guide.md
+CactusNetwork_Full_Flow_Test_Guide.md
+CactusNetwork_Project_Plan.md
+CactusNetwork_SSH_Connection_Guide.md
 
 # OS
 .DS_Store
