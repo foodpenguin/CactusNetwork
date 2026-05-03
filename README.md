@@ -1,6 +1,6 @@
 # CactusNetwork
 
-> Intent-driven DeFi execution on autopilot — powered by EIP-712 signatures, automated OTC matching, AI-driven routing (Grok), and KeeperHub.
+> Intent-driven DeFi execution on autopilot — powered by EIP-712 signatures, automated OTC matching, AI-driven routing (Grok), Uniswap api and KeeperHub.
 
 ---
 
