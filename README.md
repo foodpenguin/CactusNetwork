@@ -129,7 +129,7 @@ pnpm run dev     # starts on http://localhost:3000
 
 ## Team Members
 
-- **Shi Jui Line**: Smart Contract Development
+- **Shi Jui Lien**: Smart Contract Development
   - Designed and implemented the smart contract
   - Developed contract testing and deployment scripts
   - Design and deploy the KeeperHub workflow
